@@ -211,7 +211,8 @@ class CustomQwen3Model(Qwen2Model):
         cos_sin = self.cos_sin_cache.index_select(0, positions)
         last_dim = cos_sin.size()[-1]
         cos, sin = cos_sin.reshape(-1, 2, last_dim//2).repeat(1, 1, 2).chunk(2, dim=-2)
-        cos, sin = cos.view(-1, last_dim).contiguous(), sin.view(-1, last_dim).contiguous()
+        # BSNH
+        cos, sin = cos.view(1, -1, 1, last_dim).contiguous(), sin.view(1, -1, 1, last_dim).contiguous()
 
         for layer in self.layers[self.start_layer:self.end_layer]:
             hidden_states, residual = layer(

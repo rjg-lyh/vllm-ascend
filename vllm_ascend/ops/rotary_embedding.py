@@ -32,11 +32,11 @@ def custom_rotary_embedding_enabled(query, neox_style, head_size):
 def rope_forward_oot(
     self,
     positions: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
     query: torch.Tensor,
     key: torch.Tensor,
     offsets: Optional[torch.Tensor] = None,
+    cos: torch.Tensor = None,
+    sin: torch.Tensor = None,
     is_neox_style_override: Optional[bool] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     import torch_npu
@@ -63,17 +63,30 @@ def rope_forward_oot(
         raise NotImplementedError(
             "Batched rotary embedding is currently not supported on NPU.")
     else:
-        # TODO: Remove the contiguous in the future.
-        query = query.contiguous().view(query.shape[0], -1)
-        key = key.contiguous().view(key.shape[0], -1)
-        torch_npu._npu_rotary_embedding(
-            cos,
-            sin,
-            query,
-            key,
-            self.head_size,
-            neox_style,
-        )
+        if cos and sin and neox_style:
+            # TODO: Remove the contiguous in the future.
+            # BSNH
+            query = query.contiguous().view(1, query.shape[0], -1, self.head_size)
+            key = key.contiguous().view(1, key.shape[0], -1, self.head_size)
+            # only support when head_size=128 and neox_style=True
+            torch_npu.npu_apply_rotary_pos_emb(
+                query,
+                key,
+                cos,
+                sin
+            )
+        else:
+            # TODO: Remove the contiguous in the future.
+            query = query.contiguous().view(query.shape[0], -1)
+            key = key.contiguous().view(key.shape[0], -1)
+            torch_npu._npu_rotary_embedding(
+                positions,
+                query,
+                key,
+                self.head_size,
+                self.cos_sin_cache,
+                neox_style,
+            )
     return query.view(query_shape), key.view(key_shape)
 
 
