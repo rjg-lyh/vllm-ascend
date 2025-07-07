@@ -109,7 +109,7 @@ class CustomQwen3Attention(Qwen3Attention):
                  rope_scaling: Optional[tuple] = None,
                  prefix: str = "",
                  attn_type: str = AttentionType.DECODER) -> None:
-        super().__init__(hidden_size
+        super().__init__(hidden_size=hidden_size,
                          num_heads=num_heads,
                          num_kv_heads=num_kv_heads,
                          max_position=max_position,
@@ -172,7 +172,7 @@ class CustomQwen3Attention(Qwen3Attention):
         return output, pad_size
 
 
-class CustomQwen3DecoderLayer(Qwen3DecoderLayer):
+class CustomQwen3DecoderLayer(nn.Module):
 
     def __init__(
         self,
@@ -181,10 +181,7 @@ class CustomQwen3DecoderLayer(Qwen3DecoderLayer):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        super().__init__(config=config,
-                         cache_config=cache_config,
-                         quant_config=quant_config,
-                         prefix=prefix)
+        super().__init__()
         self.hidden_size = config.hidden_size
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
@@ -287,7 +284,7 @@ class CustomQwen3DecoderLayer(Qwen3DecoderLayer):
         else:
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states, self.pad_size = self.mlp(hidden_states)
         return hidden_states, residual, self.pad_size
     
 
@@ -341,7 +338,7 @@ class CustomQwen3Model(Qwen2Model):
                 pad_size
             )
         if self.enable_fc:
-            pad_size = self.layer[0].pad_size
+            pad_size = self.layers[0].pad_size
             hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
             residual = tensor_model_parallel_all_gather(residual, 0)
             if pad_size > 0:
