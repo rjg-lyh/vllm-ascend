@@ -62,6 +62,7 @@ class CustomQwen3MLP(Qwen3MLP):
         self.tp_rank = get_tensor_model_parallel_rank()
         self.enable_fc = envs.VLLM_ENABLE_FC
         if self.enable_fc:
+            # if flashcomm2 enbaled, replace Linear+AllReduce with All2All+Linear
             self.down_proj = ReplicatedLinear(
                 intermediate_size,
                 hidden_size,
@@ -83,6 +84,7 @@ class CustomQwen3MLP(Qwen3MLP):
         x = self.act_fn(gate_up)
         pad_size = 0
         if self.enable_fc:
+            # pad input because AllGather requires token_num to be divisible by tp_size
             x, pad_size = pad(x, self.tp_size)
             output = torch.empty(x.shape, dtype=x.dtype, device=x.device)
             dist.all_to_all_single(output, x)
@@ -162,6 +164,7 @@ class CustomQwen3Attention(Qwen3Attention):
         attn_output = self.attn(q, k, v)
         pad_size = 0
         if self.enable_fc:
+            # pad input because AllGather requires token_num to be divisible by tp_size
             attn_output, pad_size = pad(attn_output, self.tp_size)
             output = torch.empty(attn_output.shape, dtype=attn_output.dtype, device=attn_output.device)
             dist.all_to_all_single(output, attn_output)
@@ -186,7 +189,6 @@ class CustomQwen3DecoderLayer(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
         self.enable_fc = envs.VLLM_ENABLE_FC
-        self.pad_size = 0
         # Requires transformers > 4.32.0
         rope_theta = getattr(config, "rope_theta", 1000000)
         rope_scaling = getattr(config, "rope_scaling", None)
@@ -262,30 +264,29 @@ class CustomQwen3DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         pad_size: int = 0
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        self.pad_size = pad_size
         # Self Attention
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             if self.enable_fc:
-                hidden_states, residual = self.pre_attention_process(hidden_states, residual, self.pad_size)
+                hidden_states, residual = self.pre_attention_process(hidden_states, residual, pad_size)
             else:
                 hidden_states, residual = self.input_layernorm(
                     hidden_states, residual)
-        hidden_states, self.pad_size = self.self_attn(
+        hidden_states, pad_size = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
 
         # Fully Connected
         if self.enable_fc:
-            hidden_states, residual = self.pre_mlp_process(hidden_states, residual, self.pad_size)
+            hidden_states, residual = self.pre_mlp_process(hidden_states, residual, pad_size)
         else:
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
-        hidden_states, self.pad_size = self.mlp(hidden_states)
-        return hidden_states, residual, self.pad_size
+        hidden_states, pad_size = self.mlp(hidden_states)
+        return hidden_states, residual, pad_size
     
 
 ALL_DECODER_LAYER_TYPES = {
@@ -338,7 +339,6 @@ class CustomQwen3Model(Qwen2Model):
                 pad_size
             )
         if self.enable_fc:
-            pad_size = self.layers[0].pad_size
             hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
             residual = tensor_model_parallel_all_gather(residual, 0)
             if pad_size > 0:
