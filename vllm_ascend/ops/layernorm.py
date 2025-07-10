@@ -21,7 +21,7 @@ import torch
 from vllm.model_executor.layers.layernorm import RMSNorm
 
 
-class AddRMSNormQuant(RMSNorm):
+class AddRMSNormW8A8Quant(RMSNorm):
     """Root mean square normalization.
 
     Computes x -> w * x / sqrt(E[x^2] + eps) where w is the learned weight.
