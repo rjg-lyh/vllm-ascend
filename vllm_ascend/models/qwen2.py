@@ -190,12 +190,14 @@ class CustomQwen2Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
         with_prefill: bool,
         pad_size: int,
     ) -> tuple[torch.Tensor, int]:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+        q, k = self.rotary_emb(positions, q, k, cos=cos, sin=sin, skip_index_select=True)
         attn_output = self.attn(q, k, v)
         if self.fc_level == 1:
             output, _ = self.o_proj(attn_output, with_prefill, pad_size)
@@ -262,6 +264,8 @@ class CustomQwen2DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
+        cos,
+        sin,
         flashcomm_v1_enabled: bool,
         pad_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -281,6 +285,8 @@ class CustomQwen2DecoderLayer(nn.Module):
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
+            cos=cos,
+            sin=sin,
             with_prefill=flashcomm_v1_enabled,
             pad_size=pad_size,
         )
@@ -313,6 +319,7 @@ class CustomQwen2Model(Qwen2Model):
                          prefix=prefix,
                          decoder_layer_type=decoder_layer_type)
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.cos_sin_cache = self.layers[0].self_attn.rotary_emb.cos_sin_cache
 
     def forward(
         self,
@@ -341,11 +348,17 @@ class CustomQwen2Model(Qwen2Model):
         if flashcomm_v1_enabled:
             num_tokens = hidden_states.size(0)
             pad_size = (self.tp_size - (num_tokens % self.tp_size)) % self.tp_size
+        cos_sin = self.cos_sin_cache.index_select(0, positions)
+        last_dim = cos_sin.size()[-1]
+        cos, sin = cos_sin.reshape(-1 ,2, last_dim // 2).repeat(1, 1, 2).chunk(2, dim=-2)
+        cos, sin = cos.view(1, -1, 1, last_dim).contiguous(), sin.view(1, -1, 1, last_dim).contiguous()
         for layer in self.layers[self.start_layer:self.end_layer]:
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 residual,
+                cos,
+                sin,
                 flashcomm_v1_enabled,
                 pad_size,
             )
