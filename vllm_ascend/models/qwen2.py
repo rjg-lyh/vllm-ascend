@@ -36,7 +36,7 @@ from vllm.distributed import (
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm.forward_context import get_forward_context
 import vllm_ascend.envs as ascend_envs
-from vllm_ascend.ops.linear import MaybeScatterRowParallelLinear
+from vllm_ascend.ops.linear import MaybeScatterRowParallelLinear, MaybeGatherQKVParallelLinear, MaybeGatherMergedColumnParallelLinear
 
 def all_gather_and_maybe_unpad(
     hidden_states: torch.Tensor,
@@ -59,15 +59,15 @@ class CustomQwen2MLP(nn.Module):
     ) -> None:
         super().__init__()
         self.fc_level = ascend_envs.VLLM_ASCEND_ENABLE_FLASHCOMM 
-        
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
-        )
+
         if self.fc_level == 1:
+            self.gate_up_proj = MaybeGatherMergedColumnParallelLinear(
+                hidden_size,
+                [intermediate_size] * 2,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.gate_up_proj",
+            )
             self.down_proj = MaybeScatterRowParallelLinear(
                             intermediate_size,
                             hidden_size,
@@ -76,6 +76,13 @@ class CustomQwen2MLP(nn.Module):
                             prefix=f"{prefix}.down_proj",
                             )
         else:
+            self.gate_up_proj = MergedColumnParallelLinear(
+                hidden_size,
+                [intermediate_size] * 2,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.gate_up_proj",
+            )
             self.down_proj = RowParallelLinear(
                 intermediate_size,
                 hidden_size,
@@ -88,8 +95,11 @@ class CustomQwen2MLP(nn.Module):
                              "Only silu is supported for now.")
         self.act_fn = SiluAndMul()
 
-    def forward(self, x, with_prefill, pad_size):
-        gate_up, _ = self.gate_up_proj(x)
+    def forward(self, x, with_prefill, pad_size, use_gather: bool = False,):
+        if with_prefill and use_gather:
+            gate_up, _ = self.gate_up_proj(x, use_gather, pad_size)
+        else:
+            gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         if self.fc_level == 1:
             x, _ = self.down_proj(x, with_prefill, pad_size)
@@ -138,16 +148,18 @@ class CustomQwen2Attention(nn.Module):
         self.dual_chunk_attention_config = dual_chunk_attention_config
         self.fc_level = ascend_envs.VLLM_ASCEND_ENABLE_FLASHCOMM
 
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=True,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
-        )
+
         if self.fc_level == 1:
+            self.qkv_proj = MaybeGatherQKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj",
+            )
+
             self.o_proj = MaybeScatterRowParallelLinear(
                 self.total_num_heads * self.head_dim,
                 hidden_size,
@@ -156,6 +168,16 @@ class CustomQwen2Attention(nn.Module):
                 prefix=f"{prefix}.o_proj",
             )
         else:
+
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj",
+            )
             self.o_proj = RowParallelLinear(
                 self.total_num_heads * self.head_dim,
                 hidden_size,
@@ -194,8 +216,12 @@ class CustomQwen2Attention(nn.Module):
         sin: torch.Tensor,
         with_prefill: bool,
         pad_size: int,
+        use_gather: bool = False,
     ) -> tuple[torch.Tensor, int]:
-        qkv, _ = self.qkv_proj(hidden_states)
+        if use_gather:
+            qkv, _ = self.qkv_proj(hidden_states, use_gather, pad_size)
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k, cos=cos, sin=sin, skip_index_select=True)
         attn_output = self.attn(q, k, v)
@@ -259,6 +285,8 @@ class CustomQwen2DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps)
         
+        self.use_gather = True
+        
     def forward(
         self,
         positions: torch.Tensor,
@@ -277,25 +305,49 @@ class CustomQwen2DecoderLayer(nn.Module):
                     residual = F.pad(residual, (0, 0, 0, pad_size))
                 residual = torch.chunk(residual, self.tp_size, dim=0)[self.tp_rank]
             hidden_states = self.input_layernorm(hidden_states)
+            
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                cos=cos,
+                sin=sin,
+                with_prefill=flashcomm_v1_enabled,
+                pad_size=pad_size,
+            )
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
             if flashcomm_v1_enabled:
-                hidden_states = all_gather_and_maybe_unpad(hidden_states, pad_size)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            cos=cos,
-            sin=sin,
-            with_prefill=flashcomm_v1_enabled,
-            pad_size=pad_size,
-        )
+                if not self.use_gather:
+                    hidden_states = all_gather_and_maybe_unpad(hidden_states, pad_size)
+            if flashcomm_v1_enabled:
+
+                hidden_states = self.self_attn(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    cos=cos,
+                    sin=sin,
+                    with_prefill=flashcomm_v1_enabled,
+                    pad_size=pad_size,
+                    use_gather=self.use_gather,
+                )
+            else:
+                hidden_states = self.self_attn(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    cos=cos,
+                    sin=sin,
+                    with_prefill=flashcomm_v1_enabled,
+                    pad_size=pad_size,
+                )
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
         if flashcomm_v1_enabled:
-            hidden_states = all_gather_and_maybe_unpad(hidden_states, pad_size)
-        hidden_states = self.mlp(hidden_states, flashcomm_v1_enabled, pad_size)
+            if not self.use_gather:
+                hidden_states = all_gather_and_maybe_unpad(hidden_states, pad_size)
+        hidden_states = self.mlp(hidden_states, flashcomm_v1_enabled, pad_size, self.use_gather)
+
         return hidden_states, residual
 
 

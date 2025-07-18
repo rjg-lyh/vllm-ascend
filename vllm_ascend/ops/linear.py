@@ -26,7 +26,7 @@ from vllm.model_executor.parameter import (BasevLLMParameter,
 # yapf: enable
 from vllm.model_executor.utils import set_weight_attrs
 
-from vllm.model_executor.layers.linear import RowParallelLinear
+from vllm.model_executor.layers.linear import RowParallelLinear, QKVParallelLinear, MergedColumnParallelLinear
 import torch.nn.functional as F
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import LinearMethodBase
@@ -138,4 +138,91 @@ class CostomUnquantizedLinearMethod(LinearMethodBase):
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         return dispatch_unquantized_gemm()(x, layer.weight, bias)
-    
+
+
+class MaybeGatherQKVParallelLinear(QKVParallelLinear):
+
+    def forward(
+        self,
+        input_, 
+        use_gather: bool = False,
+        pad_size: int = -1,
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
+        bias = self.bias if not self.skip_bias_add else None
+        
+        # Matrix multiply.
+        assert self.quant_method is not None
+
+        if use_gather:
+            tp_rank = get_tensor_model_parallel_rank()
+            tp_size = get_tensor_model_parallel_world_size()
+            origin_device = input_.device
+            origin_dtype = input_.dtype
+            output = torch.empty(input_.shape[0]*tp_size, self.weight.shape[0], dtype=origin_dtype, device=origin_device)
+            currnet_rank = torch.npu.current_device()
+            commDomain = str(currnet_rank // tp_size)
+
+
+            torch_npu.atb._npu_all_gather_matmul(input_, self.weight, output, None, rank=tp_rank, rankSize=tp_size, commDomain=commDomain)
+            if bias is not None:
+                bias = bias.reshape(1, -1)
+                output = torch.add(output, bias)
+
+            if pad_size > 0:
+                output = output[:-pad_size, :]
+
+        else:
+            output_parallel = self.quant_method.apply(self, input_, bias)
+            if self.gather_output:
+                # All-gather across the partitions.
+                output = tensor_model_parallel_all_gather(output_parallel)
+            else:
+                output = output_parallel
+        
+        output_bias = self.bias if self.skip_bias_add else None
+        if not self.return_bias:
+            return output
+        return output, output_bias
+
+class MaybeGatherMergedColumnParallelLinear(MergedColumnParallelLinear):
+
+    def forward(
+        self,
+        input_, 
+        use_gather: bool = False,
+        pad_size: int = -1,
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
+        bias = self.bias if not self.skip_bias_add else None
+
+        # Matrix multiply.
+        assert self.quant_method is not None
+
+        
+        if use_gather:
+            
+            tp_rank = get_tensor_model_parallel_rank()
+            tp_size = get_tensor_model_parallel_world_size()
+            origin_device = input_.device
+            origin_dtype = input_.dtype
+            
+            output = torch.empty(input_.shape[0]*tp_size, self.weight.shape[0], dtype=origin_dtype, device=origin_device)
+            currnet_rank = torch.npu.current_device()
+            commDomain = str(currnet_rank // tp_size)
+
+            torch_npu.atb._npu_all_gather_matmul(input_, self.weight, output, bias, rank=tp_rank, rankSize=tp_size, commDomain=commDomain)
+
+            if pad_size > 0:
+                output = output[:-pad_size, :]
+            
+        else:
+            output_parallel = self.quant_method.apply(self, input_, bias)
+            if self.gather_output:
+                # All-gather across the partitions.
+                output = tensor_model_parallel_all_gather(output_parallel)
+            else:
+                output = output_parallel
+
+        output_bias = self.bias if self.skip_bias_add else None
+        if not self.return_bias:
+            return output
+        return output, output_bias
