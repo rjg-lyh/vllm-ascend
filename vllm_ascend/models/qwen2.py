@@ -52,6 +52,34 @@ def maybe_pad_and_reduce_scatter(
     return hidden_states
 
 
+class CustomQwen2MLP(Qwen2MLP):
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(hidden_size=hidden_size,
+                         intermediate_size=intermediate_size,
+                         hidden_act=hidden_act,
+                         quant_config=quant_config,
+                         prefix=prefix)
+
+    def forward(self, x, flashcomm_level, pad_size):
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        if flashcomm_level == 0:
+            x = tensor_model_parallel_all_reduce(x)
+        if flashcomm_level == 1:
+            x = maybe_pad_and_reduce_scatter(
+                x, pad_size)
+        return x, pad_size
+
+
 class CustomQwen2Attention(Qwen2Attention):
 
     def __init__(
@@ -84,6 +112,8 @@ class CustomQwen2Attention(Qwen2Attention):
     def forward(self,
                 positions: torch.Tensor,
                 hidden_states: torch.Tensor,
+                flashcomm_level: int,
+                pad_size: int,
                 cos: Optional[torch.Tensor] = None,
                 sin: Optional[torch.Tensor] = None) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
@@ -101,6 +131,11 @@ class CustomQwen2Attention(Qwen2Attention):
             q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
+        if flashcomm_level == 0:
+            output = tensor_model_parallel_all_reduce(output)
+        if flashcomm_level == 1:
+            output = maybe_pad_and_reduce_scatter(
+                output, pad_size)
         return output
 
 
@@ -144,7 +179,7 @@ class CustomQwen2DecoderLayer(nn.Module):
             attn_type=attn_type,
             dual_chunk_attention_config=dual_chunk_attention_config,
         )
-        self.mlp = Qwen2MLP(
+        self.mlp = CustomQwen2MLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
@@ -166,7 +201,7 @@ class CustomQwen2DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
-        flashcomm_v1_enabled: bool,
+        flashcomm_level: int,
         pad_size: int,
         cos: Optional[torch.Tensor] = None,
         sin: Optional[torch.Tensor] = None,
@@ -174,7 +209,7 @@ class CustomQwen2DecoderLayer(nn.Module):
         # Self Attention
         if residual is None:
             residual = hidden_states
-            if flashcomm_v1_enabled:
+            if flashcomm_level != 0:
                 if pad_size > 0:
                     residual = F.pad(residual, (0, 0, 0, pad_size))
                 residual = torch.chunk(residual, self.tp_size,
@@ -183,29 +218,21 @@ class CustomQwen2DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
-            if flashcomm_v1_enabled:
+            if flashcomm_level != 0:
                 hidden_states = all_gather_and_maybe_unpad(
                     hidden_states, pad_size)
         hidden_states = self.self_attn(positions=positions,
                                        hidden_states=hidden_states,
+                                       flashcomm_level=flashcomm_level,
+                                       pad_size=pad_size,
                                        cos=cos,
                                        sin=sin)
-        if flashcomm_v1_enabled:
-            hidden_states = maybe_pad_and_reduce_scatter(
-                hidden_states, pad_size)
-        else:
-            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        if flashcomm_v1_enabled:
+        if flashcomm_level != 0:
             hidden_states = all_gather_and_maybe_unpad(hidden_states, pad_size)
-        hidden_states = self.mlp(hidden_states)
-        if flashcomm_v1_enabled:
-            hidden_states = maybe_pad_and_reduce_scatter(
-                hidden_states, pad_size)
-        else:
-            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        hidden_states = self.mlp(hidden_states, flashcomm_level, pad_size)
         return hidden_states, residual
 
 
@@ -250,14 +277,14 @@ class CustomQwen2Model(Qwen2Model):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
         pad_size = 0
-        flashcomm_v1_enabled = False
+        flashcomm_level = 0
         attn_metadata = get_forward_context().attn_metadata
-        if ascend_envs.VLLM_ASCEND_ENABLE_FLASHCOMM == 1 and \
+        if ascend_envs.VLLM_ASCEND_ENABLE_FLASHCOMM != 0 and \
             envs.VLLM_USE_V1 and \
             attn_metadata is not None and \
             attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
-            flashcomm_v1_enabled = True
-        if flashcomm_v1_enabled:
+            flashcomm_level = ascend_envs.VLLM_ASCEND_ENABLE_FLASHCOMM
+        if flashcomm_level != 0:
             num_tokens = hidden_states.size(0)
             pad_size = (self.tp_size -
                         (num_tokens % self.tp_size)) % self.tp_size
@@ -279,7 +306,7 @@ class CustomQwen2Model(Qwen2Model):
                 positions,
                 hidden_states,
                 residual,
-                flashcomm_v1_enabled,
+                flashcomm_level,
                 pad_size,
                 cos=cos,
                 sin=sin,
@@ -290,7 +317,7 @@ class CustomQwen2Model(Qwen2Model):
                 "residual": residual
             })
         hidden_states, _ = self.norm(hidden_states, residual)
-        if flashcomm_v1_enabled:
+        if flashcomm_level != 0:
             hidden_states = all_gather_and_maybe_unpad(hidden_states, pad_size)
         return hidden_states
 
