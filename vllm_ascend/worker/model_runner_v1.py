@@ -1155,6 +1155,350 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 total_num_scheduled_tokens, sample_indices, finished_sending,
                 finished_recving)
 
+    def _simple_process_reqs(
+        self,
+        scheduler_output,
+        attn_metadata,
+        positions,
+        cached_token,
+        cached_spec,
+        # graph_pad_size,
+        accepted_num = 0,
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+    ) -> torch.Tensor:
+        token_each_reqs = 1
+        if cached_spec is not None:
+            token_each_reqs = 1 + len(cached_spec[0])
+        # Check input valid
+        # total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        # assert total_num_scheduled_tokens > 0
+
+        # 不涉及spec 删除 ??
+        # if cached_spec is not None:
+        #     token_each_reqs = 1 + len(cached_spec[0])
+        if (self.use_aclgraph and
+                total_num_scheduled_tokens <= self.aclgraph_batch_sizes[-1]):
+            # Add padding to the batch size.
+            num_input_tokens = self.vllm_config.pad_for_cudagraph(
+                total_num_scheduled_tokens)
+        else:
+            # Eager mode.
+            num_input_tokens = total_num_scheduled_tokens
+
+
+            
+        num_reqs = self.input_batch.num_reqs
+        total_num_scheduled_tokens = token_each_reqs*num_reqs
+        if isinstance(accepted_num, torch.Tensor):
+            positions[:total_num_scheduled_tokens] += torch.repeat_interleave(accepted_num, token_each_reqs) + 1
+        else:
+            positions[:total_num_scheduled_tokens] += 1
+
+        req_indices = torch.repeat_interleave(self.arange_npu[:num_reqs], token_each_reqs, dim=0)
+
+        # req_indices = np.repeat(self.arange_np[:num_reqs],
+        #                         num_scheduled_tokens)
+        cu_num_tokens = np.cumsum(token_each_reqs)
+        # cumsums_offsets = np.repeat(cu_num_tokens - num_scheduled_tokens,
+        #                             num_scheduled_tokens)
+        sample_indices = cu_num_tokens - 1
+        sample_indices = torch.from_numpy(sample_indices).to(self.device,
+                                                             non_blocking=True)
+        # arange = self.arange_np[:total_num_scheduled_tokens] - cumsums_offsets
+
+        # positions_np = self.positions_np[:total_num_scheduled_tokens]
+        # np.add(self.input_batch.num_computed_tokens_cpu[req_indices],
+        #        arange,
+        #        out=positions_np)
+
+        # Calculate M-RoPE positions.
+        # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
+        # if self.uses_mrope:
+        #     self._calc_mrope_positions(scheduler_output)
+
+        # if self.uses_mrope:
+        #     # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
+        #     self.mrope_positions[:, :total_num_scheduled_tokens].copy_(
+        #         self.mrope_positions_cpu[:, :total_num_scheduled_tokens],
+        #         non_blocking=True)
+
+        # self.positions[total_num_scheduled_tokens:num_input_tokens].zero_()
+        # self.positions[:total_num_scheduled_tokens].copy_(
+        #     self.positions_cpu[:total_num_scheduled_tokens], non_blocking=True)
+        # positions = self.positions[:num_input_tokens]
+        # self.query_lens = torch.from_numpy(num_scheduled_tokens)
+
+        # self.seq_lens_np[:num_reqs] = (
+        #     self.input_batch.num_computed_tokens_cpu[:num_reqs] +
+        #     num_scheduled_tokens)
+        # seq_lens = self.seq_lens_cpu[:num_reqs]
+
+        block_table_indices = (req_indices * self.max_num_blocks_per_req +
+                               positions[:total_num_scheduled_tokens] // self.block_size)
+
+
+        block_table_cpu = self.input_batch.block_table[0].get_cpu_tensor()# 这个[0]是哪来的??
+        block_numbers = block_table_cpu.flatten()[block_table_indices].numpy()
+        block_offsets = positions[:total_num_scheduled_tokens] % self.block_size
+        np.add(block_numbers * self.block_size,
+               block_offsets,
+               out=self.slot_mapping_np[:total_num_scheduled_tokens])
+        
+
+
+
+        # attn_metadata_i = attn_metadata#[first_layer_in_group] first_layer_in_group???
+        # attn_metadata_i.slot_mapping[:total_num_scheduled_tokens] = self.slot_mapping[:total_num_scheduled_tokens]
+        # input_positions = positions[:total_num_scheduled_tokens]
+        # attn_metadata_i.decode.input_positions[:total_num_scheduled_tokens] = input_positions
+        # attn_metadata_i.decode.seq_lens[:total_num_scheduled_tokens] = (input_positions + 1).to(self.seq_lens.dtype)
+        # cos, sin = self.model.model.layers[0].self_attn.rotary_emb.get_cos_sin(attn_metadata_i.decode.input_positions)
+        # attn_metadata_i.decode.cos = cos
+        # attn_metadata_i.decode.sin = sin
+
+        index = torch.argmin(torch.cat([cached_token, torch.full((num_reqs, 1), -1, device=self.device)], dim = 1), dim = 1) - 1
+        last_tokens = cached_token[torch.arange(num_reqs), index]
+        if token_each_reqs == 1:
+            self.input_ids = last_tokens
+
+        # ascend_config = get_ascend_config()
+        # use_spec_decode = len(
+        #     scheduler_output.scheduled_spec_decode_tokens) > 0
+        # if np.array_equal(self.seq_lens_np[:num_reqs], num_scheduled_tokens):
+        #     attn_state = AscendAttentionState.PrefillNoCache
+        # # We assume it is the decode stage, where prefill occurs but only one token is not hit in cache.
+        # elif np.all(num_scheduled_tokens == 1):
+        #     attn_state = AscendAttentionState.DecodeOnly
+        #     if self.speculative_config and self.speculative_config.method == 'deepseek_mtp':
+        #         # SpecDecoding now supports seq_len=1 and seq_len=2
+        #         attn_state = AscendAttentionState.SpecDecoding
+        # # Speculative decoding.
+        # elif np.all(num_valid_tokens == 1):
+        #     attn_state = AscendAttentionState.SpecDecoding
+        # # splitfuse
+        # elif not ascend_config.ascend_scheduler_config.enabled or self.chunked_prefill_enabled:
+        #     attn_state = AscendAttentionState.ChunkedPrefill
+        # else:
+        #     attn_state = AscendAttentionState.PrefillCacheHit
+
+        # # NOTE: when use ring_mla, attn_mask don't need to generate here.
+        # if not self.use_ring_mla or attn_state == AscendAttentionState.PrefillNoCache:
+        #     attn_mask = self._make_attention_mask(
+        #         seq_lens=seq_lens,
+        #         query_lens=num_scheduled_tokens,
+        #         position=positions,
+        #         attn_state=attn_state)
+        #     self.attn_mask = attn_mask
+        # self.attn_state = attn_state  # type: ignore
+
+
+
+        extra_builder_kwargs = {}
+
+        self.query_start_loc_np[0] = 0
+        self.query_start_loc_np[1:num_reqs + 1] = cu_num_tokens
+        self.query_start_loc[:num_reqs + 1].copy_(
+            self.query_start_loc_cpu[:num_reqs + 1], non_blocking=True)
+        self.seq_lens[:num_reqs].copy_(self.seq_lens_cpu[:num_reqs],
+                                       non_blocking=True)
+        self.slot_mapping[:total_num_scheduled_tokens].copy_(
+            self.slot_mapping_cpu[:total_num_scheduled_tokens],
+            non_blocking=True)
+
+        # Fill unused with -1. Needed for reshape_and_cache
+        self.slot_mapping[total_num_scheduled_tokens:].fill_(-1)
+        self.seq_lens[num_reqs:].fill_(0)
+        self.query_start_loc[num_reqs + 1:].fill_(-1)
+
+        query_start_loc = self.query_start_loc[:num_reqs + 1]
+        # Use host tensor, other wise error: tensor.hostData is null
+        common_attn_metadata = CommonAttentionMetadata(
+            query_start_loc=query_start_loc,
+            seq_lens=self.seq_lens_cpu[:num_reqs])
+        self.seq_lens_list = self.seq_lens_np.tolist()[:num_input_tokens]
+        #?????
+        attn_state = AscendAttentionState.DecodeOnly
+        with_prefill = attn_state not in [
+            AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding
+        ]
+        enable_dbo = self._check_dbo_is_valid(self.query_lens.tolist(),
+                                              attn_state,
+                                              total_num_scheduled_tokens)
+
+        maybe_padded_num_tokens = total_num_scheduled_tokens
+        if self.torchair_graph_enabled and not with_prefill:
+            maybe_padded_num_tokens = self.select_torchair_padded_batch_size(
+                total_num_scheduled_tokens)
+        (padded_num_tokens_across_dp, num_tokens_across_dp, with_prefill,
+         enable_dbo) = self._get_forward_metadata_across_dp(
+             maybe_padded_num_tokens, total_num_scheduled_tokens, with_prefill,
+             enable_dbo)
+        extra_builder_kwargs['enable_dbo_across_dp'] = enable_dbo
+
+        # TODO(zzzzwwjj): this code need to refactor afterwards.
+        self.with_prefill = with_prefill
+        # Add num_token_pad_size and num_reqs_pad_size here for torchair graph mode
+        if self.torchair_graph_enabled and not with_prefill:
+            num_token_pad_size = padded_num_tokens_across_dp - total_num_scheduled_tokens
+            num_reqs_pad_size = (
+                padded_num_tokens_across_dp // self.decode_token_per_req -
+                num_reqs)
+            assert num_token_pad_size >= 0 and num_reqs_pad_size >= 0
+
+            extra_builder_kwargs['num_token_pad_size'] = num_token_pad_size
+            extra_builder_kwargs['num_reqs_pad_size'] = num_reqs_pad_size
+            self.num_reqs_pad_size = num_reqs_pad_size
+        self.extra_builder_kwargs = extra_builder_kwargs
+
+        max_num_scheduled_tokens = 0#TODO 每轮step重复计算，可以优化
+        for _, req_id in enumerate(self.input_batch.req_ids):
+            num_tokens = scheduler_output.num_scheduled_tokens[req_id]
+
+            max_num_scheduled_tokens = max(max_num_scheduled_tokens, num_tokens)
+
+        if self.vllm_config.model_config.use_mla:
+            attn_metadata = self.attn_metadata_builder.build(  # type: ignore
+                num_reqs=num_reqs,
+                num_actual_tokens=total_num_scheduled_tokens,
+                max_query_len=max_num_scheduled_tokens,
+                common_attn_metadata=common_attn_metadata,
+                common_prefix_len=None,
+                **extra_builder_kwargs,
+            )
+        else:
+            attn_metadata = self.attn_metadata_builder.build(  # type: ignore
+                num_reqs=num_reqs,
+                num_actual_tokens=total_num_scheduled_tokens,
+                max_query_len=max_num_scheduled_tokens,
+                common_attn_metadata=common_attn_metadata,
+                common_prefix_len=None,
+                **extra_builder_kwargs,
+            )
+
+        # attn_metadata_i = attn_metadata#[first_layer_in_group] first_layer_in_group???
+        attn_metadata.slot_mapping[:total_num_scheduled_tokens] = self.slot_mapping[:total_num_scheduled_tokens]
+        input_positions = positions[:total_num_scheduled_tokens]
+        attn_metadata.decode.input_positions[:total_num_scheduled_tokens] = input_positions
+        attn_metadata.decode.seq_lens[:total_num_scheduled_tokens] = (input_positions + 1).to(self.seq_lens.dtype)
+        cos, sin = self.model.model.layers[0].self_attn.rotary_emb.get_cos_sin(attn_metadata.decode.input_positions)
+        attn_metadata.decode.cos = cos
+        attn_metadata.decode.sin = sin
+
+        attn_metadata.num_input_tokens = num_input_tokens
+
+        # Prepare input_ids
+        token_indices = (positions[:total_num_scheduled_tokens] +
+                         req_indices * self.input_batch.token_ids_cpu.shape[1])
+        torch.index_select(self.input_batch.token_ids_cpu_tensor.flatten(),
+                           0,
+                           torch.from_numpy(token_indices),
+                           out=self.input_ids_cpu[:total_num_scheduled_tokens])
+        # Copy the tensors to the NPU.
+        self.input_ids[:total_num_scheduled_tokens].copy_(
+            self.input_ids_cpu[:total_num_scheduled_tokens], non_blocking=True)
+
+        # _prepare_inputs may reorder the batch, so we must gather multi
+        # modal outputs after that to ensure the correct order
+        if self.is_multimodal_model:
+            # Run the multimodal encoder if any.
+            self._execute_mm_encoder(scheduler_output)
+            mm_embeds = self._gather_mm_embeddings(scheduler_output)
+        else:
+            mm_embeds = []
+
+        if self.is_multimodal_model:
+            # NOTE(woosuk): To unify token ids and soft tokens (vision
+            # embeddings), we always use embeddings (rather than token ids)
+            # as input to the multimodal model, even when the input is text.
+            input_ids = self.input_ids[:total_num_scheduled_tokens]
+            if mm_embeds:
+                inputs_embeds = self.model.get_input_embeddings(
+                    input_ids, mm_embeds)
+            else:
+                inputs_embeds = self.model.get_input_embeddings(input_ids)
+            # TODO(woosuk): Avoid the copy. Optimize.
+            self.inputs_embeds[:total_num_scheduled_tokens].copy_(
+                inputs_embeds)
+            inputs_embeds = self.inputs_embeds[:num_input_tokens]
+            input_ids = None
+        else:
+            # For text-only models, we use token ids as input.
+            # While it is possible to use embeddings as input just like the
+            # multimodal models, it is not desirable for performance since
+            # then the embedding layer is not included in the ACL Graph.
+            input_ids = self.input_ids[:num_input_tokens]
+            inputs_embeds = None
+        if self.uses_mrope:
+            positions = self.mrope_positions[:, :num_input_tokens]
+
+        if self.torchair_graph_enabled and not with_prefill:
+            input_ids = self.input_ids[:padded_num_tokens_across_dp]
+            positions = self.positions[:padded_num_tokens_across_dp]
+
+        # Run forward pass
+        # TODO(zzzzwwjj): check param `num_tokens_across_dp` later.
+        with set_ascend_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=padded_num_tokens_across_dp,
+                num_tokens_across_dp=num_tokens_across_dp,
+                with_prefill=with_prefill):
+            with ProfileExecuteDuration().capture_async("forward"):
+                self.maybe_setup_kv_connector(scheduler_output)
+                model_kwargs = {}
+                if self.torchair_graph_enabled:
+                    model_kwargs["kv_caches"] = self.kv_caches
+                    model_kwargs["attn_metadata"] = attn_metadata
+                if envs_ascend.VLLM_ASCEND_ENABLE_DBO and with_prefill:
+                    model_kwargs["graph_enable"] = False  # type: ignore
+                if self.torchair_graph_enabled and not with_prefill:
+                    compiled_model = self._get_torchair_lazy_compiled_model(
+                        padded_num_tokens_across_dp)
+                    hidden_states = compiled_model(
+                        input_ids=input_ids,
+                        positions=positions,
+                        intermediate_tensors=intermediate_tensors,
+                        inputs_embeds=inputs_embeds,
+                        **model_kwargs)
+                else:
+                    assert self.model is not None
+                    hidden_states = self.model(
+                        input_ids=input_ids,
+                        positions=positions,
+                        intermediate_tensors=intermediate_tensors,
+                        inputs_embeds=inputs_embeds,
+                        **model_kwargs)
+
+        self.maybe_wait_for_kv_save()
+        finished_sending, finished_recving = self.get_finished_kv_transfer(
+            scheduler_output)
+        use_spec_decode = len(
+            scheduler_output.scheduled_spec_decode_tokens) > 0
+        if not use_spec_decode:
+            # NOTE(woosuk): Due to chunked prefills, the batch may contain
+            # partial requests. While we should not sample any token
+            # from these partial requests, we do so for simplicity.
+            # We will ignore the sampled tokens from the partial requests.
+            # TODO: Support prompt logprobs.
+            spec_decode_metadata = None
+        else:
+            # Get the number of draft tokens for each request.
+            # Iterate over the dictionary rather than all requests since not all
+            # requests have draft tokens.
+            num_draft_tokens = np.zeros(num_reqs, dtype=np.int32)
+            for req_id, draft_token_ids in (
+                    scheduler_output.scheduled_spec_decode_tokens.items()):
+                req_idx = self.input_batch.req_id_to_index[req_id]
+                num_draft_tokens[req_idx] = len(draft_token_ids)
+
+            spec_decode_metadata = self._calc_spec_decode_metadata(
+                num_draft_tokens, cu_num_tokens)
+            sample_indices = spec_decode_metadata.logits_indices
+
+        return (attn_metadata, hidden_states, spec_decode_metadata, positions,
+                total_num_scheduled_tokens, sample_indices, finished_sending,
+                finished_recving)
+
     def _calc_spec_decode_metadata(
         self,
         num_draft_tokens: np.ndarray,
@@ -1320,124 +1664,179 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, torch.Tensor]:
-        with ProfileExecuteDuration().capture_async(
-                "prepare input and forward"):
-            self._update_states(scheduler_output)
-            if not scheduler_output.total_num_scheduled_tokens:
-                if not has_kv_transfer_group():
-                    logger.debug(
-                        "skip this step for we receive the data from remote disaggregate prefill node"
+        
+        self._update_states(scheduler_output)
+        self.total_step = scheduler_output.num_step
+        # cached values
+        attn_metadata = None
+        positions = None
+        graph_pad_size = None
+        sampled_tokens = None
+        sample_indices = None
+        has_spec_tokens = None
+        
+        # cached return values
+        cached_sampled_token_ids = []
+        cached_spec_token = []
+        cached_logprobs = []
+        cached_prompt_logprobs_dict = []
+        finished_sending = set()
+
+        finished_recving = set()
+
+        for self.curr_step in range(0, self.total_step):
+
+            with ProfileExecuteDuration().capture_async(
+                    "prepare input and forward"):
+                
+                if not scheduler_output.total_num_scheduled_tokens:
+                    if not has_kv_transfer_group():
+                        logger.debug(
+                            "skip this step for we receive the data from remote disaggregate prefill node"
+                        )
+                        # Return empty ModelRunnerOuptut if there's no work to do.
+                        return EMPTY_MODEL_RUNNER_OUTPUT
+                    return self.kv_connector_no_forward(scheduler_output)
+                
+                if self.curr_step == 0:#第0个token或者没开mutilstep
+                    #todo 这里是否需要_exxcute_model
+                    (attn_metadata, hidden_states, spec_decode_metadata, positions,
+                    num_scheduled_tokens, sample_indices, temp_finished_sending,
+                    temp_finished_recving) = (self._process_reqs(scheduler_output,
+                                                            intermediate_tensors))
+                else:
+                    (attn_metadata, hidden_states, spec_decode_metadata, positions,
+                    num_scheduled_tokens, sample_indices, temp_finished_sending,
+                    temp_finished_recving) = (self._simple_process_reqs(scheduler_output,
+                                                                        attn_metadata,
+                                                                        positions,
+                                                                        sampled_tokens,
+                                                                        cached_spec_token[-1],
+                                                                        0,
+                                                                        intermediate_tensors))# TODO 该如何写
+                    
+                if temp_finished_sending is not None:  
+                    finished_sending.update(temp_finished_sending)
+                if temp_finished_recving is not None: 
+                    finished_recving.update(temp_finished_recving)
+
+            with ProfileExecuteDuration().capture_async("post process"):
+                logits = self.model.compute_logits(hidden_states[sample_indices],
+                                                None)
+
+                # Apply structured output bitmasks if present
+                if scheduler_output.grammar_bitmask is not None:
+                    logits = self.apply_grammar_bitmask(scheduler_output, logits)
+
+                # Sample the next token and get logprobs if needed.
+                sampling_metadata = self.input_batch.sampling_metadata
+                if spec_decode_metadata is None:
+                    sampler_output = self.sampler(
+                        logits=logits,
+                        sampling_metadata=sampling_metadata,
                     )
-                    # Return empty ModelRunnerOuptut if there's no work to do.
-                    return EMPTY_MODEL_RUNNER_OUTPUT
-                return self.kv_connector_no_forward(scheduler_output)
-            (attn_metadata, hidden_states, spec_decode_metadata, positions,
-             num_scheduled_tokens, sample_indices, finished_sending,
-             finished_recving) = (self._process_reqs(scheduler_output,
-                                                     intermediate_tensors))
+                else:
+                    # TODO:mtp_input_tokens, last_accepted_index,两个参数没用上，希望没mtp
 
-        with ProfileExecuteDuration().capture_async("post process"):
-            logits = self.model.compute_logits(hidden_states[sample_indices],
-                                               None)
+                    # When indexing with a tensor (bonus_logits_indices), PyTorch
+                    # creates a new tensor with separate storage from the original
+                    # logits tensor. This means any in-place operations on bonus_logits
+                    # won't affect the original logits tensor.
+                    bonus_logits = logits[
+                        spec_decode_metadata.bonus_logits_indices]
+                    sampler_output = self.sampler(
+                        logits=bonus_logits,
+                        sampling_metadata=sampling_metadata,
+                    )
+                    bonus_token_ids = sampler_output.sampled_token_ids
 
-            # Apply structured output bitmasks if present
-            if scheduler_output.grammar_bitmask is not None:
-                logits = self.apply_grammar_bitmask(scheduler_output, logits)
+                    # Just like `bonus_logits`, `target_logits` is a new tensor with
+                    # separate storage from the original `logits` tensor. Therefore,
+                    # it is safe to update `target_logits` in place.
+                    target_logits = logits[
+                        spec_decode_metadata.target_logits_indices]
+                    output_token_ids = self.rejection_sampler(
+                        spec_decode_metadata,
+                        None,  # draft_probs
+                        target_logits,
+                        bonus_token_ids,
+                        sampling_metadata,
+                    )#rejection类可能要重写
+                    sampler_output.sampled_token_ids = output_token_ids
 
-            # Sample the next token and get logprobs if needed.
-            sampling_metadata = self.input_batch.sampling_metadata
-            if spec_decode_metadata is None:
-                sampler_output = self.sampler(
-                    logits=logits,
-                    sampling_metadata=sampling_metadata,
-                )
-            else:
-                # When indexing with a tensor (bonus_logits_indices), PyTorch
-                # creates a new tensor with separate storage from the original
-                # logits tensor. This means any in-place operations on bonus_logits
-                # won't affect the original logits tensor.
-                bonus_logits = logits[
-                    spec_decode_metadata.bonus_logits_indices]
-                sampler_output = self.sampler(
-                    logits=bonus_logits,
-                    sampling_metadata=sampling_metadata,
-                )
-                bonus_token_ids = sampler_output.sampled_token_ids
+                # TODO(woosuk): The following loop can be slow since it iterates over
+                # the requests one by one. Optimize.
+                discard_sampled_tokens_req_indices = []
+                for i, req_id in enumerate(self.input_batch.req_ids):
+                    req_state = self.requests[req_id]
+                    seq_len = (req_state.num_computed_tokens +
+                            scheduler_output.num_scheduled_tokens[req_id])
+                    if seq_len < req_state.num_tokens:
+                        # Ignore the sampled token.
+                        # Rewind the generator state as if the token was not sampled.
+                        generator = self.input_batch.generators.get(i)
+                        if generator is not None:
+                            generator.set_offset(generator.get_offset() - 4)
+                        discard_sampled_tokens_req_indices.append(i)
 
-                # Just like `bonus_logits`, `target_logits` is a new tensor with
-                # separate storage from the original `logits` tensor. Therefore,
-                # it is safe to update `target_logits` in place.
-                target_logits = logits[
-                    spec_decode_metadata.target_logits_indices]
-                output_token_ids = self.rejection_sampler(
-                    spec_decode_metadata,
-                    None,  # draft_probs
-                    target_logits,
-                    bonus_token_ids,
+                # NOTE: NPU -> CPU Sync happens here.
+                # Move as many CPU operations as possible before this sync point.
+                logprobs_tensors = sampler_output.logprobs_tensors
+                logprobs_lists = logprobs_tensors.tolists() \
+                    if logprobs_tensors is not None else None
+
+                # Get the valid generated tokens.
+                sampled_token_ids = sampler_output.sampled_token_ids
+                max_gen_len = sampled_token_ids.shape[-1]
+                if max_gen_len == 1:
+                    # No spec decode tokens.
+                    valid_sampled_token_ids = sampled_token_ids.tolist()
+                else:
+                    # Includes spec decode tokens.
+                    valid_sampled_token_ids = self.rejection_sampler.parse_output(
+                        sampled_token_ids,
+                        self.input_batch.vocab_size,
+                    )
+                sampled_tokens = sampled_token_ids
+
+                for i in discard_sampled_tokens_req_indices:
+                    valid_sampled_token_ids[i].clear()
+
+
+                spec_token_ids = self._get_spec_token_ids(
+                    valid_sampled_token_ids,
                     sampling_metadata,
-                )
-                sampler_output.sampled_token_ids = output_token_ids
-
-            # TODO(woosuk): The following loop can be slow since it iterates over
-            # the requests one by one. Optimize.
-            discard_sampled_tokens_req_indices = []
-            for i, req_id in enumerate(self.input_batch.req_ids):
-                req_state = self.requests[req_id]
-                seq_len = (req_state.num_computed_tokens +
-                           scheduler_output.num_scheduled_tokens[req_id])
-                if seq_len < req_state.num_tokens:
-                    # Ignore the sampled token.
-                    # Rewind the generator state as if the token was not sampled.
-                    generator = self.input_batch.generators.get(i)
-                    if generator is not None:
-                        generator.set_offset(generator.get_offset() - 4)
-                    discard_sampled_tokens_req_indices.append(i)
-
-            # NOTE: NPU -> CPU Sync happens here.
-            # Move as many CPU operations as possible before this sync point.
-            logprobs_tensors = sampler_output.logprobs_tensors
-            logprobs_lists = logprobs_tensors.tolists() \
-                if logprobs_tensors is not None else None
-
-            # Get the valid generated tokens.
-            sampled_token_ids = sampler_output.sampled_token_ids
-            max_gen_len = sampled_token_ids.shape[-1]
-            if max_gen_len == 1:
-                # No spec decode tokens.
-                valid_sampled_token_ids = sampled_token_ids.tolist()
-            else:
-                # Includes spec decode tokens.
-                valid_sampled_token_ids = self.rejection_sampler.parse_output(
-                    sampled_token_ids,
-                    self.input_batch.vocab_size,
+                    scheduler_output,
+                    spec_decode_metadata,
+                    positions,
+                    num_scheduled_tokens,
+                    hidden_states,
+                    attn_metadata,
                 )
 
-            for i in discard_sampled_tokens_req_indices:
-                valid_sampled_token_ids[i].clear()
+                if has_kv_transfer_group():
+                    get_kv_transfer_group().clear_connector_metadata()
 
-            spec_token_ids = self._get_spec_token_ids(
-                valid_sampled_token_ids,
-                sampling_metadata,
-                scheduler_output,
-                spec_decode_metadata,
-                positions,
-                num_scheduled_tokens,
-                hidden_states,
-                attn_metadata,
-            )
-            if has_kv_transfer_group():
-                get_kv_transfer_group().clear_connector_metadata()
+                cached_sampled_token_ids.append(valid_sampled_token_ids)
+                cached_spec_token.append(spec_token_ids)#v
+                cached_logprobs.append(logprobs_lists)#v
+                cached_prompt_logprobs_dict.append({})#v
 
-            model_runner_output = ModelRunnerOutput(
-                req_ids=self.input_batch.req_ids,
-                req_id_to_index=self.input_batch.req_id_to_index,
-                sampled_token_ids=valid_sampled_token_ids,
-                spec_token_ids=spec_token_ids,
-                logprobs=logprobs_lists,
-                prompt_logprobs_dict={},
-                finished_sending=finished_sending,
-                finished_recving=finished_recving,
-            )
+
+        #记得和上面退行
+        return_spec_token = [None] * (self.total_step - 1)
+        return_spec_token.append(None if cached_spec_token[-1] is None else cached_spec_token[-1].tolist())
+
+        model_runner_output = ModelRunnerOutput(
+            req_ids=self.input_batch.req_ids,
+            req_id_to_index=self.input_batch.req_id_to_index,
+            sampled_token_ids=cached_sampled_token_ids,
+            spec_token_ids=return_spec_token,
+            logprobs=cached_logprobs,
+            prompt_logprobs_dict=cached_prompt_logprobs_dict,
+            finished_sending=finished_sending,
+            finished_recving=finished_recving,
+        )
 
         durations = ProfileExecuteDuration().pop_captured_sync()
         if durations:
