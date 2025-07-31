@@ -100,6 +100,9 @@ env_variables: Dict[str, Callable[[], Any]] = {
     "VLLM_ENABLE_FUSED_EXPERTS_ALLGATHER_EP":
     lambda: bool(int(os.getenv("VLLM_ENABLE_FUSED_EXPERTS_ALLGATHER_EP", '0'))
                  ),
+    # FlashComm optimization: Enable v1 and v2 by setting this flag to 1 or 2 respectively
+    "VLLM_ASCEND_ENABLE_FLASHCOMM":
+    lambda: int(os.getenv("VLLM_ASCEND_ENABLE_FLASHCOMM", '0')),
     "VLLM_ASCEND_ENABLE_DBO":
     lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_DBO", '0'))),
     # Whether to enable the model execute time observe profile. Disable it when
