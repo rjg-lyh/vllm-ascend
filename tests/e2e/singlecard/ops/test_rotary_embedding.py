@@ -9,6 +9,7 @@ from typing import Optional, Tuple, Union
 import pytest
 import torch
 import torch.nn as nn
+import torch_npu
 
 from vllm_ascend.utils import enable_custom_op
 
