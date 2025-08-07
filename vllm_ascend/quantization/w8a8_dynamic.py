@@ -27,7 +27,7 @@ import vllm_ascend.envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import FusedMoEState
 from vllm_ascend.distributed.parallel_state import get_mc2_group
-from vllm_ascend.ops.fused_moe import select_experts
+from vllm_ascend.ops.fused_moe import select_experts, return_row_idx
 from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_NZ, AscendSocVersion,
                                dispose_tensor, get_ascend_soc_version,
                                npu_stream_switch, npu_wait_tensor,
@@ -471,14 +471,8 @@ def fused_prefill_experts_with_mc2(
         return hidden_states_outputs, shared_outputs, expert_token_nums, group_list_type
 
 
-def init_routing_quant(hidden_states, top_k, topk_ids, global_num_experts):
+def init_routing_quant(hidden_states, top_k, topk_ids, row_idx, global_num_experts):
     num_tokens, _ = hidden_states.shape
-    row_idx_len = num_tokens * top_k
-    row_idx = (torch.arange(0,
-                            row_idx_len,
-                            dtype=torch.int32,
-                            device=hidden_states.device).view(
-                                top_k, -1).permute(1, 0).contiguous())
     hidden_states, expanded_row_idx, expanded_expert_idx = torch_npu.npu_moe_init_routing(
         hidden_states,
         row_idx=row_idx,
@@ -504,6 +498,7 @@ def fused_experts_with_all2all(hidden_states: torch.Tensor,
                                w2_scale: torch.Tensor,
                                topk_weights: torch.Tensor,
                                topk_ids: torch.Tensor,
+                               row_idx: torch.Tensor,
                                top_k: int,
                                expert_map: torch.Tensor = None,
                                ep_group: GroupCoordinator = None,
@@ -536,7 +531,7 @@ def fused_experts_with_all2all(hidden_states: torch.Tensor,
             )
         else:
             quantized_tokens, expanded_row_idx, global_expert_tokens, token_scales = init_routing_quant(
-                hidden_states, top_k, topk_ids, global_num_experts)
+                hidden_states, top_k, topk_ids, row_idx, global_num_experts)
 
         gather_sizes = global_expert_tokens.new_empty(
             global_expert_tokens.shape[0])
@@ -568,12 +563,6 @@ def fused_experts_with_all2all(hidden_states: torch.Tensor,
         expert_tokens = expert_tokens.to(torch.int64)
         group_list_type = 1
     else:
-        row_idx_len = num_tokens * top_k
-        row_idx = torch.arange(0,
-                               row_idx_len,
-                               dtype=torch.int32,
-                               device=topk_weights.device).view(
-                                   top_k, -1).permute(1, 0).contiguous()
         hidden_states, expanded_row_idx, expanded_expert_idx = torch_npu.npu_moe_init_routing(
             hidden_states,
             row_idx=row_idx,
@@ -645,6 +634,7 @@ def fused_experts(hidden_states: torch.Tensor,
                   w2_scale: torch.Tensor,
                   topk_weights: torch.Tensor,
                   topk_ids: torch.Tensor,
+                  row_idx: torch.Tensor,
                   top_k: int,
                   expert_map: torch.Tensor = None):
     original_shape = hidden_states.shape
@@ -695,12 +685,6 @@ def fused_experts(hidden_states: torch.Tensor,
         hidden_states = hidden_states[sorted_token_indices]
         group_list_type = 1
     else:
-        row_idx_len = num_tokens * top_k
-        row_idx = torch.arange(0,
-                               row_idx_len,
-                               dtype=torch.int32,
-                               device=topk_weights.device).view(
-                                   top_k, -1).permute(1, 0).contiguous()
         hidden_states, expanded_row_idx, expanded_expert_idx = torch_npu.npu_moe_init_routing(
             hidden_states,
             row_idx=row_idx,
@@ -948,8 +932,9 @@ class AscendW8A8DynamicFusedMoEMethod:
                     # y2_flag=False, # old api; 第三个输出是否输出
                     routed_scaling_factor=1,
                     eps=float(1e-20))
+                row_idx = return_row_idx(x, top_k)
             else:
-                topk_weights, topk_ids = select_experts(
+                topk_weights, topk_ids, row_idx = select_experts(
                     hidden_states=x,
                     router_logits=router_logits,
                     top_k=top_k,
@@ -1027,6 +1012,7 @@ class AscendW8A8DynamicFusedMoEMethod:
                                  w2_scale=layer.w2_weight_scale,
                                  topk_weights=topk_weights,
                                  topk_ids=topk_ids,
+                                 row_idx=row_idx,
                                  top_k=top_k,
                                  expert_map=expert_map)
         else:
@@ -1043,6 +1029,7 @@ class AscendW8A8DynamicFusedMoEMethod:
                 w2_scale=layer.w2_weight_scale,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
+                row_idx=row_idx,
                 top_k=top_k,
                 expert_map=expert_map,
                 ep_group=self.ep_group,
