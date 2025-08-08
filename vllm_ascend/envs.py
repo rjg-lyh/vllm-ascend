@@ -169,6 +169,12 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # VLLM_ASCEND_EXTERNAL_DP_LB_ENABLED: used for external distributed data parallelism in vllm-ascend, 0.9.1 specific.
     "VLLM_ASCEND_EXTERNAL_DP_LB_ENABLED":
     lambda: bool(int(os.getenv("VLLM_ASCEND_EXTERNAL_DP_LB_ENABLED", '0'))),
+    # Whether to enable GroupedMatmulSwigluQuant fusion kernel in allgather
+    #   0: default, gmm + swiglu + dynamic_quant
+    #   1: enable grouped_matmul_swiglu_quant
+    "VLLM_ASCEND_ENABLE_GROUPED_MATMUL_SWIGLU_QUANT":
+    lambda: bool(
+        int(os.getenv("VLLM_ASCEND_ENABLE_GROUPED_MATMUL_SWIGLU_QUANT", "0"))),
 }
 
 # end-env-vars-definition
