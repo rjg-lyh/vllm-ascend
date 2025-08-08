@@ -371,7 +371,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled and self.vllm_config.model_config.use_mla
         self.use_cached_npu_graph = ascend_config.torchair_graph_config.use_cached_graph
         self.torchair_graph_batch_sizes = ascend_config.torchair_graph_config.graph_batch_sizes
-        self.use_ring_mla = ascend_config.chunked_prefill_for_mla
 
         if ascend_config.torchair_graph_config.graph_batch_sizes_init:
             self.init_torchair_graph_batch_sizes()
@@ -636,12 +635,19 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         if self.is_kv_consumer and self.torchair_graph_enabled and len(
                 self.torchair_graph_batch_sizes
         ) == 1 and not self.in_profile_run:
-            max_num_decode_tokens = self.torchair_graph_batch_sizes[0]
-            num_tokens_across_dp = torch.tensor([max_num_decode_tokens] *
-                                                self.dp_size,
-                                                device="cpu",
-                                                dtype=torch.int32)
-            return max_num_decode_tokens, num_tokens_across_dp, False, enable_dbo
+            with_prefill_tensor = torch.tensor([with_prefill],
+                                               device="npu",
+                                               dtype=torch.bool)
+            dist.all_reduce(with_prefill_tensor,
+                            group=get_dp_group().device_group,
+                            op=dist.ReduceOp.MAX)
+            if not with_prefill_tensor.item():
+                max_num_decode_tokens = self.torchair_graph_batch_sizes[0]
+                num_tokens_across_dp = torch.tensor([max_num_decode_tokens] *
+                                                    self.dp_size,
+                                                    device="cpu",
+                                                    dtype=torch.int32)
+                return max_num_decode_tokens, num_tokens_across_dp, False, enable_dbo
 
         num_tokens_across_dp = [0] * self.dp_size * 2
         num_tokens_across_dp[self.dp_rank] = maybe_padded_num_tokens
@@ -988,7 +994,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             attn_state = AscendAttentionState.PrefillCacheHit
 
         # NOTE: when use ring_mla, attn_mask don't need to generate here.
-        if not self.use_ring_mla or attn_state == AscendAttentionState.PrefillNoCache:
+        if not self.vllm_config.model_config.use_mla:
             attn_mask = self._make_attention_mask(
                 seq_lens=seq_lens,
                 query_lens=num_scheduled_tokens,
@@ -1640,9 +1646,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             maybe_padded_num_tokens = self.select_torchair_padded_batch_size(
                 num_tokens)
 
-        # For kv producer, with prefill always true
-        if self.is_kv_producer:
-            with_prefill = True
         # Padding for DP
         (num_tokens, num_tokens_across_dp, with_prefill,
          enable_dbo) = self._get_forward_metadata_across_dp(
