@@ -34,6 +34,7 @@ from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_NZ, AscendSocVersion,
                                super_kernel)
 
 CHUNK_SIZE: int = ascend_envs.VLLM_ASCEND_FUSED_MOE_MC2_CHUNK_SIZE
+ENABLE_GROUPED_MATMUL_SWIGLU_QUANT: bool = ascend_envs.VLLM_ASCEND_ENABLE_GROUPED_MATMUL_SWIGLU_QUANT
 
 
 def apply_mlp_decode(hidden_states_wrapper: List[torch.Tensor],
@@ -113,6 +114,7 @@ def apply_mlp_decode(hidden_states_wrapper: List[torch.Tensor],
 def apply_mlp(hidden_states: torch.Tensor,
               w1: torch.Tensor,
               w1_scale: torch.Tensor,
+              w1_scale_fp32: torch.Tensor,
               w2: torch.Tensor,
               w2_scale: torch.Tensor,
               group_list: torch.Tensor,
@@ -128,6 +130,7 @@ def apply_mlp(hidden_states: torch.Tensor,
         w1: expert weights1 with shape
             (num_experts, hidden_size, intermediate_size * 2)
         w1_scale: weights1 scale with shape (num_experts, intermediate_size * 2)
+        w1_scale: weights1 scale with shape (num_experts, intermediate_size * 2) and dtype torch.float32
         w2: expert weights2 with shape
             (num_experts, intermediate_size, hidden_size)
         w2_scale: weights2 scale with shape (num_experts, hidden_size)
@@ -166,13 +169,14 @@ def apply_mlp(hidden_states: torch.Tensor,
         # TODO w4a8 scene: dynamic acquisition of dtype in the future
         _output_dtype = torch.bfloat16
 
-    if ascend_envs.VLLM_ASCEND_ENABLE_GROUPED_MATMUL_SWIGLU_QUANT:
+    if ENABLE_GROUPED_MATMUL_SWIGLU_QUANT and group_list_type == 0:
         # gmm1: gate_up_proj & act_fn: swiglu
         hidden_states, swiglu_out_scale, _ = torch_npu.npu_grouped_matmul_swiglu_quant(
             x=hidden_states,
             weight=w1,
+            bias=bias1,
             group_list=group_list,
-            weight_scale=w1_scale,
+            weight_scale=w1_scale_fp32,
             x_scale=pertoken_scale)
     else:
         # gmm1: gate_up_proj
@@ -633,6 +637,7 @@ def fused_experts_with_all2all(hidden_states: torch.Tensor,
 def fused_experts(hidden_states: torch.Tensor,
                   w1: torch.Tensor,
                   w1_scale: torch.Tensor,
+                  w1_scale_fp32: torch.Tensor,
                   w2: torch.Tensor,
                   w2_scale: torch.Tensor,
                   topk_weights: torch.Tensor,
@@ -708,6 +713,7 @@ def fused_experts(hidden_states: torch.Tensor,
     hidden_states = apply_mlp(hidden_states,
                               w1,
                               w1_scale,
+                              w1_scale_fp32,
                               w2,
                               w2_scale,
                               expert_tokens,
@@ -1010,13 +1016,10 @@ class AscendW8A8DynamicFusedMoEMethod:
                 dynamic_scale_for_share=shared_dequant_scale,
                 mc2_mask=kwargs.get("mc2_mask", None))
         elif fused_moe_state == FusedMoEState.AllGather:
-            if ascend_envs.VLLM_ASCEND_ENABLE_GROUPED_MATMUL_SWIGLU_QUANT:
-                w1_scale = layer.w13_weight_scale_fp32
-            else:
-                w1_scale = layer.w13_weight_scale
             return fused_experts(hidden_states=x,
                                  w1=layer.w13_weight,
-                                 w1_scale=w1_scale,
+                                 w1_scale=layer.w13_weight_scale,
+                                 w1_scale_fp32=layer.w13_weight_scale_fp32
                                  w2=layer.w2_weight,
                                  w2_scale=layer.w2_weight_scale,
                                  topk_weights=topk_weights,
@@ -1049,6 +1052,9 @@ class AscendW8A8DynamicFusedMoEMethod:
                 1, 2).contiguous()
             layer.w2_weight.data = layer.w2_weight.data.transpose(
                 1, 2).contiguous()
+        if ENABLE_GROUPED_MATMUL_SWIGLU_QUANT:
+            layer.w13_weight.data = torch_npu.npu_format_cast(
+                layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
         if self.enable_weight_nz_layout:
             # cast quantized weight tensors in NZ layout for higher inference speed
             layer.w13_weight.data = torch_npu.npu_format_cast(
