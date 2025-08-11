@@ -130,7 +130,7 @@ def apply_mlp(hidden_states: torch.Tensor,
         w1: expert weights1 with shape
             (num_experts, hidden_size, intermediate_size * 2)
         w1_scale: weights1 scale with shape (num_experts, intermediate_size * 2)
-        w1_scale: weights1 scale with shape (num_experts, intermediate_size * 2) and dtype torch.float32
+        w1_scale_fp32: weights1 scale with shape (num_experts, intermediate_size * 2) and dtype torch.float32
         w2: expert weights2 with shape
             (num_experts, intermediate_size, hidden_size)
         w2_scale: weights2 scale with shape (num_experts, hidden_size)
@@ -315,6 +315,7 @@ def fused_experts_with_mc2(
         down_out_list = apply_mlp(expand_x,
                                   w1,
                                   w1_scale,
+                                  w1_scale,
                                   w2,
                                   w2_scale,
                                   expert_token_nums,
@@ -498,6 +499,7 @@ def init_routing_quant(hidden_states, top_k, topk_ids, global_num_experts):
 def fused_experts_with_all2all(hidden_states: torch.Tensor,
                                w1: torch.Tensor,
                                w1_scale: torch.Tensor,
+                               w1_scale_fp32: torch.Tensor,
                                w2: torch.Tensor,
                                w2_scale: torch.Tensor,
                                topk_weights: torch.Tensor,
@@ -589,6 +591,7 @@ def fused_experts_with_all2all(hidden_states: torch.Tensor,
         hidden_states,
         w1,
         w1_scale,  #17
+        w1_scale_fp32,
         w2,
         w2_scale,
         expert_tokens,  #16
@@ -1035,6 +1038,7 @@ class AscendW8A8DynamicFusedMoEMethod:
                 hidden_states=x,
                 w1=layer.w13_weight,
                 w1_scale=layer.w13_weight_scale,
+                w1_scale_fp32=layer.w13_weight_scale_fp32,
                 w2=layer.w2_weight,
                 w2_scale=layer.w2_weight_scale,
                 topk_weights=topk_weights,
