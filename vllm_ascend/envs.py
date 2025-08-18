@@ -157,6 +157,12 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # FlashComm optimization: Enable v1 and v2 by setting this flag to 1 or 2 respectively
     "VLLM_ASCEND_ENABLE_FLASHCOMM":
     lambda: int(os.getenv("VLLM_ASCEND_ENABLE_FLASHCOMM", '0')),
+    # LcocMatmulReduceScatter optimization
+    "VLLM_ASCEND_ENABLE_LCOC_MATMUL_RS":
+    lambda: int(os.getenv("VLLM_ASCEND_ENABLE_LCOC_MATMUL_RS", '0')),
+    # LcocAllGatherMatmul optimization
+    "VLLM_ASCEND_ENABLE_LCOC_AG_MATMUL":
+    lambda: int(os.getenv("VLLM_ASCEND_ENABLE_LCOC_AG_MATMUL", '0')),
     # The tolerance of the kv cache size, if the difference between the
     # actual kv cache size and the cached kv cache size is less than this value,
     # then the cached kv cache size will be used.

@@ -5,29 +5,30 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen3Config
-from vllm.attention import AttentionType
+from vllm.attention import Attention, AttentionType
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (get_pp_group, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_gather,
-                              tensor_model_parallel_all_reduce,
                               tensor_model_parallel_reduce_scatter)
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
 from vllm.model_executor.models.qwen2 import Qwen2Model
-from vllm.model_executor.models.qwen3 import Qwen3Attention, Qwen3MLP
 from vllm.model_executor.models.utils import (AutoWeightsLoader,
                                               PPMissingLayer, maybe_prefix)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 
 from vllm_ascend.ops.layernorm import AddRMSNormW8A8Quant
+from vllm_ascend.ops.linear import CustomRowParallelLinear, CustomQKVParallelLinear, CustomMergedColumnParallelLinear
 import vllm_ascend.envs as ascend_envs
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 
@@ -52,7 +53,122 @@ def maybe_pad_and_reduce_scatter(
     return hidden_states
 
 
-class CustomQwen3Attention(Qwen3Attention):
+class CustomQwen3MLP(nn.Module):
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.gate_up_proj = CustomMergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
+        )
+        self.down_proj = CustomRowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
+        )
+        if hidden_act != "silu":
+            raise ValueError(f"Unsupported activation: {hidden_act}. "
+                             "Only silu is supported for now.")
+        self.act_fn = SiluAndMul()
+
+    def forward(
+        self,
+        x,
+        flashcomm_v1_enabled: bool,
+        matmul_rs_enabled: bool,
+        ag_matmal_enabled: bool,
+        pad_size: int,
+    ) -> torch.Tensor:
+        gate_up, _ = self.gate_up_proj(x, flashcomm_v1_enabled, ag_matmal_enabled, pad_size)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x, flashcomm_v1_enabled, matmul_rs_enabled, pad_size)
+        return x
+
+
+class CustomQwen3Attention(nn.Module):
+
+    def __init__(self,
+                 hidden_size: int,
+                 num_heads: int,
+                 num_kv_heads: int,
+                 max_position: int = 4096 * 32,
+                 head_dim: Optional[int] = None,
+                 rms_norm_eps: float = 1e-06,
+                 qkv_bias: bool = False,
+                 rope_theta: float = 10000,
+                 cache_config: Optional[CacheConfig] = None,
+                 quant_config: Optional[QuantizationConfig] = None,
+                 rope_scaling: Optional[tuple] = None,
+                 prefix: str = "",
+                 attn_type: str = AttentionType.DECODER) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        tp_size = get_tensor_model_parallel_world_size()
+        self.total_num_heads = num_heads
+        assert self.total_num_heads % tp_size == 0
+        self.num_heads = self.total_num_heads // tp_size
+        self.total_num_kv_heads = num_kv_heads
+        if self.total_num_kv_heads >= tp_size:
+            # Number of KV heads is greater than TP size, so we partition
+            # the KV heads across multiple tensor parallel GPUs.
+            assert self.total_num_kv_heads % tp_size == 0
+        else:
+            # Number of KV heads is less than TP size, so we replicate
+            # the KV heads across multiple tensor parallel GPUs.
+            assert tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.head_dim = head_dim or hidden_size // self.total_num_heads
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.scaling = self.head_dim**-0.5
+        self.rope_theta = rope_theta
+
+        self.qkv_proj = CustomQKVParallelLinear(
+            hidden_size,
+            self.head_dim,
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            bias=qkv_bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj",
+        )
+        self.o_proj = CustomRowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.o_proj",
+        )
+
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=self.head_dim,
+            max_position=max_position,
+            base=self.rope_theta,
+            rope_scaling=rope_scaling,
+        )
+        self.attn = Attention(self.num_heads,
+                              self.head_dim,
+                              self.scaling,
+                              num_kv_heads=self.num_kv_heads,
+                              cache_config=cache_config,
+                              quant_config=quant_config,
+                              prefix=f"{prefix}.attn",
+                              attn_type=attn_type)
+        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
     def forward(
         self,
@@ -60,8 +176,12 @@ class CustomQwen3Attention(Qwen3Attention):
         cos: torch.Tensor,
         sin: torch.Tensor,
         hidden_states: torch.Tensor,
+        flashcomm_v1_enabled: bool,
+        matmul_rs_enabled: bool,
+        ag_matmal_enabled: bool,
+        pad_size: int,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv, _ = self.qkv_proj(hidden_states, flashcomm_v1_enabled, ag_matmal_enabled, pad_size)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         # Add qk-norm
         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim,
@@ -84,7 +204,7 @@ class CustomQwen3Attention(Qwen3Attention):
         else:
             q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(attn_output, flashcomm_v1_enabled, matmul_rs_enabled, pad_size)
         return output
 
 
@@ -127,7 +247,7 @@ class CustomQwen3DecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
             attn_type=attn_type,
         )
-        self.mlp = Qwen3MLP(
+        self.mlp = CustomQwen3MLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
@@ -178,6 +298,8 @@ class CustomQwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         flashcomm_v1_enabled: bool,
+        matmul_rs_enabled: bool,
+        ag_matmal_enabled: bool,
         pad_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
@@ -192,30 +314,19 @@ class CustomQwen3DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
-            if flashcomm_v1_enabled:
-                hidden_states = all_gather_and_maybe_unpad(
-                    hidden_states, pad_size)
         hidden_states = self.self_attn(
-            positions=positions,
-            cos=cos,
-            sin=sin,
-            hidden_states=hidden_states,
+            positions,
+            cos,
+            sin,
+            hidden_states,
+            flashcomm_v1_enabled,
+            matmul_rs_enabled,
+            ag_matmal_enabled,
+            pad_size,
         )
-        if flashcomm_v1_enabled:
-            hidden_states = maybe_pad_and_reduce_scatter(
-                hidden_states, pad_size)
-        else:
-            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        if flashcomm_v1_enabled:
-            hidden_states = all_gather_and_maybe_unpad(hidden_states, pad_size)
-        hidden_states = self.mlp(hidden_states)
-        if flashcomm_v1_enabled:
-            hidden_states = maybe_pad_and_reduce_scatter(
-                hidden_states, pad_size)
-        else:
-            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        hidden_states = self.mlp(hidden_states, flashcomm_v1_enabled, matmul_rs_enabled, ag_matmal_enabled, pad_size)
         return hidden_states, residual
 
 
@@ -264,11 +375,19 @@ class CustomQwen3Model(Qwen2Model):
             residual = intermediate_tensors["residual"]
         pad_size = 0
         flashcomm_v1_enabled = False
+        matmul_rs_enabled = False
+        ag_matmal_enabled = False
         attn_metadata = get_forward_context().attn_metadata
         if ascend_envs.VLLM_ASCEND_ENABLE_FLASHCOMM == 1 and \
             attn_metadata is not None and \
             attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
             flashcomm_v1_enabled = True
+        if flashcomm_v1_enabled and \
+            ascend_envs.VLLM_ASCEND_ENABLE_LCOC_MATMUL_RS == 1:
+            matmul_rs_enabled = True
+        if flashcomm_v1_enabled and \
+            ascend_envs.VLLM_ASCEND_ENABLE_LCOC_AG_MATMUL == 1:
+            ag_matmal_enabled = True
         if flashcomm_v1_enabled:
             num_tokens = hidden_states.size(0)
             pad_size = (self.tp_size -
@@ -294,6 +413,8 @@ class CustomQwen3Model(Qwen2Model):
                 hidden_states,
                 residual,
                 flashcomm_v1_enabled,
+                matmul_rs_enabled,
+                ag_matmal_enabled,
                 pad_size,
             )
         if not get_pp_group().is_last_rank:
