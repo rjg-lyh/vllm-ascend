@@ -2,26 +2,70 @@ from collections.abc import Iterable
 from typing import Optional, Union
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen3Config
 from vllm.attention import AttentionType
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
-from vllm.distributed import get_pp_group
+from vllm.distributed import (get_pp_group, get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_world_size,
+                              tensor_model_parallel_all_gather,
+                              tensor_model_parallel_reduce_scatter)
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
+from vllm.model_executor.models.qwen2 import Qwen2MLP as Qwen3MLP
 from vllm.model_executor.models.qwen2 import Qwen2Model
-from vllm.model_executor.models.qwen3 import Qwen3Attention, Qwen3MLP
+from vllm.model_executor.models.qwen3 import Qwen3Attention
 from vllm.model_executor.models.utils import (AutoWeightsLoader,
                                               PPMissingLayer, maybe_prefix)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 
 from vllm_ascend.ops.layernorm import AddRMSNormW8A8Quant
+import vllm_ascend.envs as ascend_envs
+from vllm_ascend.attention.attention_v1 import AscendAttentionState
+
+
+def all_gather_and_maybe_unpad(
+    hidden_states: torch.Tensor,
+    pad_size: int,
+) -> torch.Tensor:
+    hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+    if pad_size > 0:
+        return hidden_states[:-pad_size, :]
+    return hidden_states
+
+
+def maybe_pad_and_reduce_scatter(
+    hidden_states: torch.Tensor,
+    pad_size: int,
+) -> torch.Tensor:
+    if pad_size > 0:
+        hidden_states = F.pad(hidden_states, (0, 0, 0, pad_size))
+    hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, 0)
+    return hidden_states
+
+
+class CustomQwen3MLP(Qwen3MLP):
+
+    def forward(
+        self,
+        x,
+        flashcomm_v1_enabled: bool,
+        matmul_rs_enabled: bool,
+        ag_matmal_enabled: bool,
+        pad_size: int,
+    ) -> torch.Tensor:
+        gate_up, _ = self.gate_up_proj(x, flashcomm_v1_enabled, ag_matmal_enabled, pad_size)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x, flashcomm_v1_enabled, matmul_rs_enabled, pad_size)
+        return x
 
 
 class CustomQwen3Attention(Qwen3Attention):
@@ -32,8 +76,13 @@ class CustomQwen3Attention(Qwen3Attention):
         cos: torch.Tensor,
         sin: torch.Tensor,
         hidden_states: torch.Tensor,
+        is_first_layer: bool,
+        flashcomm_v1_enabled: bool,
+        matmul_rs_enabled: bool,
+        ag_matmal_enabled: bool,
+        pad_size: int,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv, _ = self.qkv_proj(hidden_states, flashcomm_v1_enabled and not is_first_layer, ag_matmal_enabled, pad_size)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         # Add qk-norm
         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim,
@@ -52,7 +101,7 @@ class CustomQwen3Attention(Qwen3Attention):
                                 cos=cos,
                                 sin=sin)
         attn_output = self.attn(q, k, v)
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(attn_output, flashcomm_v1_enabled, matmul_rs_enabled, pad_size)
         return output
 
 
@@ -95,7 +144,7 @@ class CustomQwen3DecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
             attn_type=attn_type,
         )
-        self.mlp = Qwen3MLP(
+        self.mlp = CustomQwen3MLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
@@ -132,6 +181,9 @@ class CustomQwen3DecoderLayer(nn.Module):
             else:
                 self.post_attention_layernorm = RMSNorm(
                     config.hidden_size, eps=config.rms_norm_eps)
+        
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_size = get_tensor_model_parallel_world_size()
 
     def forward(
         self,
@@ -140,23 +192,38 @@ class CustomQwen3DecoderLayer(nn.Module):
         sin: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
+        is_first_layer: bool,
+        flashcomm_v1_enabled: bool,
+        matmul_rs_enabled: bool,
+        ag_matmal_enabled: bool,
+        pad_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
             residual = hidden_states
+            if flashcomm_v1_enabled:
+                if pad_size > 0:
+                    residual = F.pad(residual, (0, 0, 0, pad_size))
+                residual = torch.chunk(residual, self.tp_size,
+                                       dim=0)[self.tp_rank]
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
         hidden_states = self.self_attn(
-            positions=positions,
-            cos=cos,
-            sin=sin,
-            hidden_states=hidden_states,
+            positions,
+            cos,
+            sin,
+            hidden_states,
+            is_first_layer,
+            flashcomm_v1_enabled,
+            matmul_rs_enabled,
+            ag_matmal_enabled,
+            pad_size,
         )
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, flashcomm_v1_enabled, matmul_rs_enabled, ag_matmal_enabled, pad_size)
         return hidden_states, residual
 
 
@@ -184,6 +251,7 @@ class CustomQwen3Model(Qwen2Model):
         first_existing_layer = self.layers[self.start_layer]
         if type(first_existing_layer.self_attn.rotary_emb) is RotaryEmbedding:
             self.cos_sin_cache = first_existing_layer.self_attn.rotary_emb.cos_sin_cache
+        self.tp_size = get_tensor_model_parallel_world_size()
 
     def forward(
         self,
@@ -202,7 +270,25 @@ class CustomQwen3Model(Qwen2Model):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-
+        pad_size = 0
+        flashcomm_v1_enabled = False
+        matmul_rs_enabled = False
+        ag_matmal_enabled = False
+        attn_metadata = get_forward_context().attn_metadata
+        if ascend_envs.VLLM_ASCEND_ENABLE_FLASHCOMM == 1 and \
+            attn_metadata is not None and \
+            attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
+            flashcomm_v1_enabled = True
+        if flashcomm_v1_enabled and \
+            ascend_envs.VLLM_ASCEND_ENABLE_LCOC_MATMUL_RS == 1:
+            matmul_rs_enabled = True
+        if flashcomm_v1_enabled and \
+            ascend_envs.VLLM_ASCEND_ENABLE_LCOC_AG_MATMUL == 1:
+            ag_matmal_enabled = True
+        if flashcomm_v1_enabled:
+            num_tokens = hidden_states.size(0)
+            pad_size = (self.tp_size -
+                        (num_tokens % self.tp_size)) % self.tp_size
         # Generate cos and sin outside layers to avoid repeated calculation.
         cos, sin = None, None
         if self.cos_sin_cache is not None:
@@ -216,13 +302,21 @@ class CustomQwen3Model(Qwen2Model):
             cos, sin = cos.view(1, -1, 1, last_dim).contiguous(), sin.view(
                 1, -1, 1, last_dim).contiguous()
 
-        for layer in self.layers[self.start_layer:self.end_layer]:
+        for idx, layer in enumerate(self.layers[self.start_layer:self.end_layer]):
+            is_first_layer = False
+            if self.start_layer == 0 and idx == 0:
+                is_first_layer = True
             hidden_states, residual = layer(
                 positions,
                 cos,
                 sin,
                 hidden_states,
                 residual,
+                is_first_layer,
+                flashcomm_v1_enabled,
+                matmul_rs_enabled,
+                ag_matmal_enabled,
+                pad_size,
             )
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
@@ -230,6 +324,8 @@ class CustomQwen3Model(Qwen2Model):
                 "residual": residual
             })
         hidden_states, _ = self.norm(hidden_states, residual)
+        if flashcomm_v1_enabled:
+            hidden_states = all_gather_and_maybe_unpad(hidden_states, pad_size)
         return hidden_states
 
 
