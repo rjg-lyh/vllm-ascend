@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen3Config
-from vllm.attention import Attention, AttentionType
+from vllm.attention import AttentionType
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (get_pp_group, get_tensor_model_parallel_rank,
@@ -13,22 +13,21 @@ from vllm.distributed import (get_pp_group, get_tensor_model_parallel_rank,
                               tensor_model_parallel_all_gather,
                               tensor_model_parallel_reduce_scatter)
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
+from vllm.model_executor.models.qwen2 import Qwen2MLP as Qwen3MLP
 from vllm.model_executor.models.qwen2 import Qwen2Model
+from vllm.model_executor.models.qwen3 import Qwen3Attention
 from vllm.model_executor.models.utils import (AutoWeightsLoader,
                                               PPMissingLayer, maybe_prefix)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 
 from vllm_ascend.ops.layernorm import AddRMSNormW8A8Quant
-from vllm_ascend.ops.linear import CustomRowParallelLinear, CustomQKVParallelLinear, CustomMergedColumnParallelLinear
 import vllm_ascend.envs as ascend_envs
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 
@@ -53,35 +52,7 @@ def maybe_pad_and_reduce_scatter(
     return hidden_states
 
 
-class CustomQwen3MLP(nn.Module):
-
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        hidden_act: str,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.gate_up_proj = CustomMergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
-        )
-        self.down_proj = CustomRowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.down_proj",
-        )
-        if hidden_act != "silu":
-            raise ValueError(f"Unsupported activation: {hidden_act}. "
-                             "Only silu is supported for now.")
-        self.act_fn = SiluAndMul()
+class CustomQwen3MLP(Qwen3MLP):
 
     def forward(
         self,
@@ -97,78 +68,7 @@ class CustomQwen3MLP(nn.Module):
         return x
 
 
-class CustomQwen3Attention(nn.Module):
-
-    def __init__(self,
-                 hidden_size: int,
-                 num_heads: int,
-                 num_kv_heads: int,
-                 max_position: int = 4096 * 32,
-                 head_dim: Optional[int] = None,
-                 rms_norm_eps: float = 1e-06,
-                 qkv_bias: bool = False,
-                 rope_theta: float = 10000,
-                 cache_config: Optional[CacheConfig] = None,
-                 quant_config: Optional[QuantizationConfig] = None,
-                 rope_scaling: Optional[tuple] = None,
-                 prefix: str = "",
-                 attn_type: str = AttentionType.DECODER) -> None:
-        super().__init__()
-        self.hidden_size = hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
-        self.total_num_heads = num_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
-        self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= tp_size:
-            # Number of KV heads is greater than TP size, so we partition
-            # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % tp_size == 0
-        else:
-            # Number of KV heads is less than TP size, so we replicate
-            # the KV heads across multiple tensor parallel GPUs.
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-        self.head_dim = head_dim or hidden_size // self.total_num_heads
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
-        self.rope_theta = rope_theta
-
-        self.qkv_proj = CustomQKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=qkv_bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
-        )
-        self.o_proj = CustomRowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.o_proj",
-        )
-
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=max_position,
-            base=self.rope_theta,
-            rope_scaling=rope_scaling,
-        )
-        self.attn = Attention(self.num_heads,
-                              self.head_dim,
-                              self.scaling,
-                              num_kv_heads=self.num_kv_heads,
-                              cache_config=cache_config,
-                              quant_config=quant_config,
-                              prefix=f"{prefix}.attn",
-                              attn_type=attn_type)
-        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+class CustomQwen3Attention(Qwen3Attention):
 
     def forward(
         self,
@@ -176,12 +76,13 @@ class CustomQwen3Attention(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         hidden_states: torch.Tensor,
+        is_first_layer: bool,
         flashcomm_v1_enabled: bool,
         matmul_rs_enabled: bool,
         ag_matmal_enabled: bool,
         pad_size: int,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states, flashcomm_v1_enabled, ag_matmal_enabled, pad_size)
+        qkv, _ = self.qkv_proj(hidden_states, flashcomm_v1_enabled and not is_first_layer, ag_matmal_enabled, pad_size)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         # Add qk-norm
         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim,
@@ -287,8 +188,6 @@ class CustomQwen3DecoderLayer(nn.Module):
         
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.self_attn.o_proj.reduce_results = False
-        self.mlp.down_proj.reduce_results = False
 
     def forward(
         self,
@@ -297,6 +196,7 @@ class CustomQwen3DecoderLayer(nn.Module):
         sin: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
+        is_first_layer: bool,
         flashcomm_v1_enabled: bool,
         matmul_rs_enabled: bool,
         ag_matmal_enabled: bool,
@@ -319,6 +219,7 @@ class CustomQwen3DecoderLayer(nn.Module):
             cos,
             sin,
             hidden_states,
+            is_first_layer,
             flashcomm_v1_enabled,
             matmul_rs_enabled,
             ag_matmal_enabled,
@@ -405,13 +306,17 @@ class CustomQwen3Model(Qwen2Model):
             cos, sin = cos.view(1, -1, 1, last_dim).contiguous(), sin.view(
                 1, -1, 1, last_dim).contiguous()
 
-        for layer in self.layers[self.start_layer:self.end_layer]:
+        for idx, layer in enumerate(self.layers[self.start_layer:self.end_layer]):
+            is_first_layer = False
+            if self.start_layer == 0 and idx == 0:
+                is_first_layer = True
             hidden_states, residual = layer(
                 positions,
                 cos,
                 sin,
                 hidden_states,
                 residual,
+                is_first_layer,
                 flashcomm_v1_enabled,
                 matmul_rs_enabled,
                 ag_matmal_enabled,
