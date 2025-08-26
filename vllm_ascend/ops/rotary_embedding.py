@@ -146,6 +146,8 @@ class AscendRotaryEmbedding(RotaryEmbedding):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
+        cos: torch.Tensor = None,
+        sin: torch.Tensor = None,
         is_neox_style_override: Optional[bool] = None,
         max_seq_len: Optional[int] = None,
         is_prefill: Optional[bool] = True,
@@ -185,6 +187,7 @@ class AscendRotaryEmbedding(RotaryEmbedding):
             return q_embed.flatten(-2), k_embed.flatten(-2)
         else:
             return rope_forward_oot(self, positions, query, key, offsets,
+                                    cos, sin,
                                     is_neox_style_override,
                                     is_qwen_torchair)  # type: ignore
 

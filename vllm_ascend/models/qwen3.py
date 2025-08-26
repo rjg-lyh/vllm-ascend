@@ -28,6 +28,7 @@ from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 
 from vllm_ascend.ops.layernorm import AddRMSNormW8A8Quant
+from vllm_ascend.ops.rotary_embedding import AscendRotaryEmbedding
 import vllm_ascend.envs as ascend_envs
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 
@@ -249,7 +250,7 @@ class CustomQwen3Model(Qwen2Model):
                          decoder_layer_type=CustomQwen3DecoderLayer)
         self.cos_sin_cache = None
         first_existing_layer = self.layers[self.start_layer]
-        if type(first_existing_layer.self_attn.rotary_emb) is RotaryEmbedding:
+        if type(first_existing_layer.self_attn.rotary_emb) is AscendRotaryEmbedding:
             self.cos_sin_cache = first_existing_layer.self_attn.rotary_emb.cos_sin_cache
         self.tp_size = get_tensor_model_parallel_world_size()
 
