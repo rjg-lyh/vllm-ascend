@@ -74,8 +74,6 @@ class CustomQwen3Attention(Qwen3Attention):
     def forward(
         self,
         positions: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
         hidden_states: torch.Tensor,
         is_first_layer: bool,
         flashcomm_v1_enabled: bool,
@@ -94,13 +92,7 @@ class CustomQwen3Attention(Qwen3Attention):
                            self.head_dim)
         k_by_head = self.k_norm(k_by_head)
         k = k_by_head.view(k.shape)
-        # We optimized RotaryEmbedding by moving index_select of cos & sin outside.
-        # if cos & sin are provided, set is_cos_sin_cached to True to skip index_select.
-        q, k = self.rotary_emb(positions,
-                                q,
-                                k,
-                                cos=cos,
-                                sin=sin)
+        q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output, flashcomm_v1_enabled, matmul_rs_enabled, pad_size)
         return output
@@ -189,8 +181,6 @@ class CustomQwen3DecoderLayer(nn.Module):
     def forward(
         self,
         positions: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         is_first_layer: bool,
@@ -213,8 +203,6 @@ class CustomQwen3DecoderLayer(nn.Module):
                 hidden_states, residual)
         hidden_states = self.self_attn(
             positions,
-            cos,
-            sin,
             hidden_states,
             is_first_layer,
             flashcomm_v1_enabled,
@@ -248,10 +236,6 @@ class CustomQwen3Model(Qwen2Model):
         super().__init__(vllm_config=vllm_config,
                          prefix=prefix,
                          decoder_layer_type=CustomQwen3DecoderLayer)
-        self.cos_sin_cache = None
-        first_existing_layer = self.layers[self.start_layer]
-        if type(first_existing_layer.self_attn.rotary_emb) is AscendRotaryEmbedding:
-            self.cos_sin_cache = first_existing_layer.self_attn.rotary_emb.cos_sin_cache
         self.tp_size = get_tensor_model_parallel_world_size()
 
     def forward(
@@ -290,18 +274,6 @@ class CustomQwen3Model(Qwen2Model):
             num_tokens = hidden_states.size(0)
             pad_size = (self.tp_size -
                         (num_tokens % self.tp_size)) % self.tp_size
-        # Generate cos and sin outside layers to avoid repeated calculation.
-        cos, sin = None, None
-        if self.cos_sin_cache is not None:
-            cos_sin = self.cos_sin_cache.index_select(0, positions)
-            last_dim = cos_sin.size()[-1]
-            cos, sin = cos_sin.reshape(-1, 2,
-                                       last_dim // 2).repeat(1, 1,
-                                                             2).chunk(2,
-                                                                      dim=-2)
-            # BSNH
-            cos, sin = cos.view(1, -1, 1, last_dim).contiguous(), sin.view(
-                1, -1, 1, last_dim).contiguous()
 
         for idx, layer in enumerate(self.layers[self.start_layer:self.end_layer]):
             is_first_layer = False
@@ -309,8 +281,6 @@ class CustomQwen3Model(Qwen2Model):
                 is_first_layer = True
             hidden_states, residual = layer(
                 positions,
-                cos,
-                sin,
                 hidden_states,
                 residual,
                 is_first_layer,
