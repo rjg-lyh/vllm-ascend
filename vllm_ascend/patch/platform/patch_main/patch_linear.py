@@ -21,6 +21,7 @@ def ascend_row_forward(
     matmul_rs_enabled: bool = False,
     pad_size: int = 0,
 ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
+    tp_rank = get_tensor_model_parallel_rank()
     if self.input_is_parallel:
         input_parallel = input_
     else:
@@ -61,7 +62,7 @@ def ascend_row_forward(
         else:
             input_parallel_quant = input_parallel
         output_parallel = torch.empty(input_parallel_quant.shape[0] // self.tp_size, self.weight.shape[1], dtype=self.params_dtype, device=input_parallel.device)
-        bias_ = torch.zeros(self.weight.shape[1], dtype=torch.int).unsqueeze(0)
+        bias_ = self.quant_bias if tp_rank == 0 else torch.zeros(self.weight.shape[1], dtype=torch.int).unsqueeze(0)
         current_rank = torch.npu.current_device()
         commDomain = str(current_rank // self.tp_size)
         deq_scale = self.deq_scale.unsqueeze(0)
@@ -107,7 +108,7 @@ def ascend_column_forward(
             input_quant = input_
         current_rank = torch.npu.current_device()
         commDomain = str(current_rank // self.tp_size)
-        bias_ = torch.zeros(self.weight.shape[1], dtype=torch.int).unsqueeze(0)
+        bias_ = self.quant_bias
         deq_scale = self.deq_scale.unsqueeze(0)
         tp_rank = get_tensor_model_parallel_rank()
         torch_npu.atb._npu_all_gather_matmul(input_quant, self.weight, output_parallel, bias_, deqScale=deq_scale, rank=tp_rank, rankSize=self.tp_size, commDomain=commDomain, outdata_type=27)
