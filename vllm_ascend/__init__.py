@@ -29,5 +29,4 @@ def register_model():
     if envs.VLLM_USE_V1 and \
         envs_ascend.VLLM_ASCEND_ENABLE_FLASHCOMM != 0:
         import vllm_ascend.patch.platform.patch_main.patch_decorator
-    import vllm_ascend.patch.platform.patch_main.patch_linear
     register_model()
