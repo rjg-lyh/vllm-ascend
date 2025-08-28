@@ -6,16 +6,15 @@ import torch
 import torch.nn as nn
 from torch._dynamo.symbolic_convert import InliningInstructionTranslator
 from vllm.compilation import decorators
-from vllm.compilation.decorators import _should_ignore_torch_compile
 from vllm.compilation.counter import compilation_counter
+from vllm.compilation.decorators import _should_ignore_torch_compile
+from vllm.compilation.monitor import start_monitoring_torch_compile
 from vllm.compilation.wrapper import TorchCompileWrapperWithCustomDispatcher
 from vllm.config import CompilationLevel, VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 from vllm.utils import supports_dynamo
-
-from vllm.compilation.monitor import start_monitoring_torch_compile
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 

@@ -18,7 +18,6 @@
 from typing import Optional, Tuple, Union
 
 import torch
-import torch.nn.functional as F
 from vllm.distributed import (get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size)
 from vllm.forward_context import get_forward_context
@@ -56,7 +55,8 @@ class AddRMSNormW8A8Quant(RMSNorm):
                 tp_size = get_tensor_model_parallel_world_size()
                 tp_rank = get_tensor_model_parallel_rank()
                 from vllm_ascend.utils import maybe_pad_and_chunk_tensor
-                residual = maybe_pad_and_chunk_tensor(residual, pad_size, tp_size, tp_rank)
+                residual = maybe_pad_and_chunk_tensor(residual, pad_size,
+                                                      tp_size, tp_rank, 0)
             assert x.size(0) == residual.size(0)
             x, _, residual = torch_npu.npu_add_rms_norm_quant(
                 x,
@@ -91,7 +91,8 @@ class AscendRMSNorm(RMSNorm):
                 tp_size = get_tensor_model_parallel_world_size()
                 tp_rank = get_tensor_model_parallel_rank()
                 from vllm_ascend.utils import maybe_pad_and_chunk_tensor
-                residual = maybe_pad_and_chunk_tensor(residual, pad_size, tp_size, tp_rank)
+                residual = maybe_pad_and_chunk_tensor(residual, pad_size,
+                                                      tp_size, tp_rank, 0)
             assert x.size(0) == residual.size(0)
             if is_310p():
                 orig_dtype = residual.dtype

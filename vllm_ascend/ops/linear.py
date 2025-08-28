@@ -25,15 +25,8 @@ from vllm.distributed import (divide, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               split_tensor_along_last_dim,
                               tensor_model_parallel_all_gather,
-                              tensor_model_parallel_all_reduce,
-                              tensor_model_parallel_reduce_scatter)
-from vllm.model_executor.layers.linear import (WEIGHT_LOADER_V2_SUPPORTED,
-                                               ColumnParallelLinear,
-                                               LinearBase,
-                                               MergedColumnParallelLinear,
-                                               QKVParallelLinear,
-                                               RowParallelLinear,
-                                               UnquantizedLinearMethod)
+                              tensor_model_parallel_all_reduce)
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.quantization.base_config import \
     QuantizationConfig
 from vllm.model_executor.utils import set_weight_attrs
@@ -42,7 +35,14 @@ from vllm.forward_context import get_forward_context
 from vllm_ascend.distributed.parallel_state import (
     get_mlp_tensor_model_parallel_rank,
     get_mlp_tensor_model_parallel_world_size, get_mlp_tp_group)
-from vllm_ascend.quantization.w8a8 import AscendW8A8LinearMethod, quant_per_tensor
+from vllm_ascend.quantization.w8a8 import AscendW8A8LinearMethod
+from vllm_ascend.utils import (all_gather_and_maybe_unpad,
+                               maybe_pad_and_reduce_scatter)
+
+from vllm.model_executor.layers.linear import (  # isort: skip
+    WEIGHT_LOADER_V2_SUPPORTED, ColumnParallelLinear, LinearBase,
+    MergedColumnParallelLinear, QKVParallelLinear, RowParallelLinear,
+    UnquantizedLinearMethod)
 
 
 class AscendMlpColumnParallelLinear(ColumnParallelLinear):
@@ -324,8 +324,7 @@ class AscendDenseMergedColumnParallelLinear(MergedColumnParallelLinear):
     """
 
     def forward(
-        self,
-        input_: torch.Tensor
+        self, input_: torch.Tensor
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
         bias = self.bias if not self.skip_bias_add else None
 
@@ -337,31 +336,19 @@ class AscendDenseMergedColumnParallelLinear(MergedColumnParallelLinear):
         pad_size = forward_context.pad_size
         if not flashcomm_v1_enabled:
             output_parallel = self.quant_method.apply(self, input_, bias)
-        # 浮点
-        elif ag_matmal_enabled and isinstance(self.quant_method, UnquantizedLinearMethod):
-            pass
-        # w8a8
-        elif ag_matmal_enabled and isinstance(self.quant_method.quant_method, AscendW8A8LinearMethod):
-            output_parallel = torch.empty(input_.shape[0]*self.tp_size, self.weight.shape[1], dtype=self.params_dtype, device=input_.device)
-            if input_.dtype != torch.int8:
-                input_quant = quant_per_tensor(input_, self.aclnn_input_scale_reciprocal, self.aclnn_input_offset)
-            else:
-                input_quant = input_
-            current_rank = torch.npu.current_device()
-            commDomain = str(current_rank // self.tp_size)
-            bias_ = self.quant_bias
-            deq_scale = self.deq_scale.unsqueeze(0)
-            tp_rank = get_tensor_model_parallel_rank()
-            torch_npu.atb._npu_all_gather_matmul(input_quant, self.weight, output_parallel, bias_, deqScale=deq_scale, rank=tp_rank, rankSize=self.tp_size, commDomain=commDomain, outdata_type=27)
-            if bias is not None:
-                bias = bias.reshape(1, -1)
-                output_parallel = torch.add(output_parallel, bias)
-            if pad_size > 0:
-                output_parallel = output_parallel[:-pad_size, :]
+        # fp or bf
+        elif ag_matmal_enabled and isinstance(self.quant_method,
+                                              UnquantizedLinearMethod):
+            raise NotImplementedError(
+                "Unquantized AllGather+MatMul fusion is not implemented yet.")
+        # w8a8 quant
+        elif ag_matmal_enabled and isinstance(self.quant_method.quant_method,
+                                              AscendW8A8LinearMethod):
+            raise NotImplementedError(
+                "W8A8 quantized AllGather+MatMul fusion is not implemented yet."
+            )
         else:
-            input_ = tensor_model_parallel_all_gather(input_, 0)
-            if pad_size > 0:
-                input_ = input_[:-pad_size, :]
+            input_ = all_gather_and_maybe_unpad(input_, pad_size, 0)
             output_parallel = self.quant_method.apply(self, input_, bias)
 
         if self.gather_output:
@@ -383,8 +370,7 @@ class AscendDenseQKVParallelLinear(QKVParallelLinear):
     """
 
     def forward(
-        self,
-        input_: torch.Tensor
+        self, input_: torch.Tensor
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
         bias = self.bias if not self.skip_bias_add else None
 
@@ -400,31 +386,19 @@ class AscendDenseQKVParallelLinear(QKVParallelLinear):
         pad_size = forward_context.pad_size
         if not flashcomm_v1_enabled:
             output_parallel = self.quant_method.apply(self, input_, bias)
-        # 浮点
-        elif ag_matmal_enabled and isinstance(self.quant_method, UnquantizedLinearMethod):
-            pass
-        # w8a8
-        elif ag_matmal_enabled and isinstance(self.quant_method.quant_method, AscendW8A8LinearMethod):
-            output_parallel = torch.empty(input_.shape[0]*self.tp_size, self.weight.shape[1], dtype=self.params_dtype, device=input_.device)
-            if input_.dtype != torch.int8:
-                input_quant = quant_per_tensor(input_, self.aclnn_input_scale_reciprocal, self.aclnn_input_offset)
-            else:
-                input_quant = input_
-            current_rank = torch.npu.current_device()
-            commDomain = str(current_rank // self.tp_size)
-            bias_ = self.quant_bias
-            deq_scale = self.deq_scale.unsqueeze(0)
-            tp_rank = get_tensor_model_parallel_rank()
-            torch_npu.atb._npu_all_gather_matmul(input_quant, self.weight, output_parallel, bias_, deqScale=deq_scale, rank=tp_rank, rankSize=self.tp_size, commDomain=commDomain, outdata_type=27)
-            if bias is not None:
-                bias = bias.reshape(1, -1)
-                output_parallel = torch.add(output_parallel, bias)
-            if pad_size > 0:
-                output_parallel = output_parallel[:-pad_size, :]
+        # fp or bf
+        elif ag_matmal_enabled and isinstance(self.quant_method,
+                                              UnquantizedLinearMethod):
+            raise NotImplementedError(
+                "Unquantized AllGather+MatMul fusion is not implemented yet.")
+        # w8a8 quant
+        elif ag_matmal_enabled and isinstance(self.quant_method.quant_method,
+                                              AscendW8A8LinearMethod):
+            raise NotImplementedError(
+                "W8A8 quantized AllGather+MatMul fusion is not implemented yet."
+            )
         else:
-            input_ = tensor_model_parallel_all_gather(input_, 0)
-            if pad_size > 0:
-                input_ = input_[:-pad_size, :]
+            input_ = all_gather_and_maybe_unpad(input_, pad_size, 0)
             output_parallel = self.quant_method.apply(self, input_, bias)
 
         if self.gather_output:
@@ -446,8 +420,7 @@ class AscendDenseRowParallelLinear(RowParallelLinear):
     """
 
     def forward(
-        self,
-        input_: torch.Tensor
+        self, input_: torch.Tensor
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
         tp_rank = get_tensor_model_parallel_rank()
         forward_context = get_forward_context()
@@ -468,45 +441,29 @@ class AscendDenseRowParallelLinear(RowParallelLinear):
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
         if self.tp_size == 1 or not self.reduce_results:
-            output = self.quant_method.apply(self,
-                                            input_parallel,
-                                            bias=bias_)
+            output = self.quant_method.apply(self, input_parallel, bias=bias_)
         elif not flashcomm_v1_enabled:
             output_parallel = self.quant_method.apply(self,
-                                                    input_parallel,
-                                                    bias=bias_)
+                                                      input_parallel,
+                                                      bias=bias_)
             output = tensor_model_parallel_all_reduce(output_parallel)
-        # 浮点
-        elif matmul_rs_enabled and isinstance(self.quant_method, UnquantizedLinearMethod):
-            if pad_size > 0:
-                input_parallel = F.pad(input_parallel, (0, 0, 0, pad_size))
-            output_parallel = torch.empty(input_parallel.shape[0] // self.tp_size, self.weight.shape[0], dtype=self.params_dtype, device=input_parallel.device)
-            current_rank = torch.npu.current_device()
-            commDomain = str(current_rank // self.tp_size)
-            torch_npu.atb._npu_matmul_reduce_scatter(input_parallel, self.weight, output_parallel, None, None,  rank=self.tp_rank, rankSize=self.tp_size, commDomain=commDomain, outdata_type=27)
-            output = output_parallel
-        # w8a8
-        elif matmul_rs_enabled and isinstance(self.quant_method.quant_method, AscendW8A8LinearMethod):
-            if pad_size > 0:
-                input_parallel = F.pad(input_parallel, (0, 0, 0, pad_size))
-            if input_parallel.dtype != torch.int8:
-                input_parallel_quant = quant_per_tensor(input_parallel, self.aclnn_input_scale_reciprocal, self.aclnn_input_offset)
-            else:
-                input_parallel_quant = input_parallel
-            output_parallel = torch.empty(input_parallel_quant.shape[0] // self.tp_size, self.weight.shape[1], dtype=self.params_dtype, device=input_parallel.device)
-            bias_ = self.quant_bias if tp_rank == 0 else torch.zeros(self.weight.shape[1], dtype=torch.int).unsqueeze(0)
-            current_rank = torch.npu.current_device()
-            commDomain = str(current_rank // self.tp_size)
-            deq_scale = self.deq_scale.unsqueeze(0)
-            torch_npu.atb._npu_matmul_reduce_scatter(input_parallel_quant, self.weight, output_parallel, bias_, deqScale=deq_scale, rank=self.tp_rank, rankSize=self.tp_size, commDomain=commDomain, outdata_type=27)     # outdata_type参数，bf16=27, fp16=1
-            output = output_parallel
+        # fp or bf
+        elif matmul_rs_enabled and isinstance(self.quant_method,
+                                              UnquantizedLinearMethod):
+            raise NotImplementedError(
+                "Unquantized MatMul+ReduceScatter fusion is not implemented yet."
+            )
+        # w8a8 quant
+        elif matmul_rs_enabled and isinstance(self.quant_method.quant_method,
+                                              AscendW8A8LinearMethod):
+            raise NotImplementedError(
+                "W8A8 quantized MatMul+ReduceScatter fusion is not implemented yet."
+            )
         else:
             output_parallel = self.quant_method.apply(self,
-                                                    input_parallel,
-                                                    bias=bias_)
-            if pad_size > 0:
-                output_parallel = F.pad(output_parallel, (0, 0, 0, pad_size))
-            output = tensor_model_parallel_reduce_scatter(output_parallel, 0)
+                                                      input_parallel,
+                                                      bias=bias_)
+            output = maybe_pad_and_reduce_scatter(output_parallel, pad_size, 0)
 
         output_bias = self.bias if self.skip_bias_add else None
 

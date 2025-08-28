@@ -475,36 +475,30 @@ def get_all_reduce_merge_state(ep_size: int, is_deepseek_v3_r1: bool):
 
 def all_gather_and_maybe_unpad(
     hidden_states: torch.Tensor,
-    pad_size: int
+    pad_size: int,
+    dim: int,
 ) -> torch.Tensor:
     from vllm.distributed import tensor_model_parallel_all_gather
-    hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+    hidden_states = tensor_model_parallel_all_gather(hidden_states, dim)
     if pad_size > 0:
         return hidden_states[:-pad_size, :]
     return hidden_states
 
 
-def maybe_pad_and_reduce_scatter(
-    hidden_states: torch.Tensor,
-    pad_size: int
-) -> torch.Tensor:
+def maybe_pad_and_reduce_scatter(hidden_states: torch.Tensor, pad_size: int,
+                                 dim: int) -> torch.Tensor:
     from vllm.distributed import tensor_model_parallel_reduce_scatter
     if pad_size > 0:
         hidden_states = F.pad(hidden_states, (0, 0, 0, pad_size))
-    hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, 0)
+    hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, dim)
     return hidden_states
 
 
-def maybe_pad_and_chunk_tensor(
-    x: torch.Tensor,
-    pad_size: int,
-    tp_size: int,
-    tp_rank: int
-) -> torch.Tensor:
+def maybe_pad_and_chunk_tensor(x: torch.Tensor, pad_size: int, tp_size: int,
+                               tp_rank: int, dim: int) -> torch.Tensor:
     if pad_size > 0:
         x = F.pad(x, (0, 0, 0, pad_size))
-    x = torch.chunk(x, tp_size,
-                        dim=0)[tp_rank]
+    x = torch.chunk(x, tp_size, dim=dim)[tp_rank]
     return x
 
 
@@ -520,7 +514,10 @@ def register_ascend_customop():
     from vllm.model_executor.custom_op import CustomOp
 
     from vllm_ascend.ops.activation import AscendQuickGELU, AscendSiluAndMul
-    from vllm_ascend.ops.linear import (AscendMlpColumnParallelLinear,
+    from vllm_ascend.ops.linear import (AscendDenseMergedColumnParallelLinear,
+                                        AscendDenseQKVParallelLinear,
+                                        AscendDenseRowParallelLinear,
+                                        AscendMlpColumnParallelLinear,
                                         AscendMlpMergedColumnParallelLinear,
                                         AscendMlpRowParallelLinear,
                                         AscendDenseMergedColumnParallelLinear,
@@ -545,8 +542,9 @@ def register_ascend_customop():
             _decorated_op_cls=AscendMlpMergedColumnParallelLinear,
             name="MergedColumnParallelLinear")
     if envs_ascend.VLLM_ASCEND_ENABLE_DENSE_OPTIMIZE:
-        CustomOp.register_oot(_decorated_op_cls=AscendDenseMergedColumnParallelLinear,
-                              name="MergedColumnParallelLinear")
+        CustomOp.register_oot(
+            _decorated_op_cls=AscendDenseMergedColumnParallelLinear,
+            name="MergedColumnParallelLinear")
         CustomOp.register_oot(_decorated_op_cls=AscendDenseQKVParallelLinear,
                               name="QKVParallelLinear")
         CustomOp.register_oot(_decorated_op_cls=AscendDenseRowParallelLinear,
