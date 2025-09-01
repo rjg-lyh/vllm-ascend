@@ -168,6 +168,8 @@ def set_ascend_forward_context(
         forward_context.flashcomm_v1_enabled = flashcomm_v1_enabled
         forward_context.matmul_rs_enabled = matmul_rs_enabled
         forward_context.ag_matmal_enabled = ag_matmal_enabled
+        forward_context.flashcomm_v1_enabled = envs_ascend.VLLM_ASCEND_ENABLE_FLASHCOMM and \
+            num_tokens is not None and num_tokens > 1000
 
         if num_tokens is None and attn_metadata is not None:
             num_tokens = attn_metadata.num_actual_tokens
