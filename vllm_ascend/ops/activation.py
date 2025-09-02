@@ -41,7 +41,7 @@ class AscendSiluAndMul(SiluAndMul):
         prefetch_stream.wait_stream(torch.npu.current_stream())
 
         with torch.npu.stream(prefetch_stream):
-            MLP_DOWN_PREFETCH_SIZE = 6 * 1024 * 1024
+            MLP_DOWN_PREFETCH_SIZE = 18 * 1024 * 1024
             torch_npu.npu_prefetch(prefetch_model.model.layers[layer_idx].mlp.down_proj.weight, \
                                 dependency, MLP_DOWN_PREFETCH_SIZE)
             forward_context.layer_idx += 1

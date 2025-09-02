@@ -440,7 +440,7 @@ class AscendDenseRowParallelLinear(RowParallelLinear):
 
             with torch.npu.stream(prefetch_stream):
                 # For Qwen3-32B
-                MLP_GATE_UP_PREFETCH_SIZE = 50 * 1024 * 1024
+                MLP_GATE_UP_PREFETCH_SIZE = 125 * 1024 * 1024
                 torch_npu.npu_prefetch(prefetch_model.model.layers[layer_num].mlp.gate_up_proj.weight, \
                                     dependency, MLP_GATE_UP_PREFETCH_SIZE)
 
