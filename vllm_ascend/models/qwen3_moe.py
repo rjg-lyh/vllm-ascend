@@ -19,6 +19,7 @@
 from typing import Optional, Union
 
 import torch
+import torch_npu
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.compilation.decorators import support_torch_compile
@@ -47,6 +48,8 @@ from vllm_ascend.ops.layernorm import AddRMSNormW8A8Quant
 from vllm_ascend.quantization.w8a8 import AscendW8A8LinearMethod
 from vllm_ascend.quantization.quant_config import AscendQuantConfig
 
+is_prefetch = False  # whether prefetch feature is turned on or not
+stream_prefetch = torch_npu.npu.Stream()
 
 class CustomQwen3MoeAttention(Qwen3MoeAttention):
 
@@ -125,12 +128,14 @@ class AscendQwen3MoeDecoderLayer(nn.Module):
             self.mlp = AscendSparseMoeBlock(config=config,
                                             quant_config=quant_config,
                                             prefix=f"{prefix}.mlp")
+            self.is_moe = True
         else:
             self.mlp = Qwen3MoeMLP(hidden_size=config.hidden_size,
                                    intermediate_size=config.intermediate_size,
                                    hidden_act=config.hidden_act,
                                    quant_config=quant_config,
                                    prefix=f"{prefix}.mlp")
+            self.is_moe = False
         assert isinstance(quant_config, AscendQuantConfig), \
             "Expected quant_config to be an instance of AscendQuantConfig"
         if isinstance(self.self_attn.qkv_proj.quant_method.quant_method,
@@ -144,6 +149,9 @@ class AscendQwen3MoeDecoderLayer(nn.Module):
                                            eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps)
+        global stream_prefetch, is_prefetch
+        self.stream = stream_prefetch
+        self.is_prefetch = is_prefetch
 
         self.enable_sequence_parallelism = (
             vllm_config.compilation_config.pass_config.
@@ -191,12 +199,26 @@ class AscendQwen3MoeDecoderLayer(nn.Module):
             hidden_states = _metadata_for_padding.padding_aligned_reduce_scatter(
                 hidden_states)
 
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual)
+        if self.is_prefetch and self.is_moe:
+            prefetch_flag = hidden_states
+            s_cmo = self.stream
+            new_stream = {"new_stream": s_cmo}
+            s_cmo.wait_stream(torch.npu.current_stream())
+            with torch.npu.stream(s_cmo):
+                torch_npu.npu_prefetch(self.mlp.experts.w13_weight.data, prefetch_flag, 120*1024*1024)
+            # Fully Connected
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual)
+            hidden_states = self.mlp(hidden_states,
+                                    _metadata_for_padding=_metadata_for_padding,
+                                    new_stream=new_stream)
+        else:
+            # Fully Connected
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual)
 
-        hidden_states = self.mlp(hidden_states,
-                                 _metadata_for_padding=_metadata_for_padding)
+            hidden_states = self.mlp(hidden_states,
+                                    _metadata_for_padding=_metadata_for_padding)
 
         return hidden_states, residual
 

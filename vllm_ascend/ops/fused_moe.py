@@ -1285,6 +1285,7 @@ class AscendFusedMoE(FusedMoE):
         shared_experts: Optional[Any] = None,
         gate: Optional[Any] = None,
         _metadata_for_padding: Optional[MetadataForPadding] = None,
+        new_stream: Optional[dict] = None,
     ):
         assert self.quant_method is not None
 
@@ -1408,6 +1409,7 @@ class AscendFusedMoE(FusedMoE):
             token_dispatcher=self.token_dispatcher,
             prefix=self.prefix,
             running_in_super_kernel=running_in_super_kernel,
+            new_stream=new_stream,
         )
 
         if isinstance(e_hidden_states, tuple):
@@ -1546,7 +1548,8 @@ class AscendSparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attn_metadata: Optional[AttentionMetadata] = None,
-        _metadata_for_padding: Optional[MetadataForPadding] = None
+        _metadata_for_padding: Optional[MetadataForPadding] = None,
+        new_stream: Optional[dict] = None,
     ) -> torch.Tensor:
         if attn_metadata is None:
             attn_metadata = get_forward_context().attn_metadata
@@ -1565,6 +1568,7 @@ class AscendSparseMoeBlock(nn.Module):
             top_k=self.top_k,
             enable_force_load_balance=enable_force_load_balance,
             shared_experts=None,
-            _metadata_for_padding=_metadata_for_padding)
+            _metadata_for_padding=_metadata_for_padding,
+            new_stream=new_stream)
 
         return hidden_states

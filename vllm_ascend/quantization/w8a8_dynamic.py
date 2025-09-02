@@ -121,7 +121,8 @@ def apply_mlp(hidden_states: torch.Tensor,
               dynamic_scale: torch.Tensor = None,
               group_list_type: int = 1,
               w1_scale_bias: torch.Tensor = None,
-              w2_scale_bias: torch.Tensor = None) -> torch.Tensor:
+              w2_scale_bias: torch.Tensor = None,
+              new_stream: Optional[dict] = None,) -> torch.Tensor:
     """
     apply MLP: gate_up_proj -> swiglu -> down_proj
 
@@ -168,6 +169,9 @@ def apply_mlp(hidden_states: torch.Tensor,
         bias2 = [w2_scale_bias]
         # TODO w4a8 scene: dynamic acquisition of dtype in the future
         _output_dtype = torch.bfloat16
+
+    if new_stream is not None: # stream for prefetch
+        torch.npu.current_stream().wait_stream(new_stream["new_stream"])  
 
     if ENABLE_GROUPED_MATMUL_SWIGLU_QUANT and group_list_type == 0:
         # gmm1: gate_up_proj & act_fn: swiglu
@@ -636,7 +640,9 @@ def fused_experts(hidden_states: torch.Tensor,
                   topk_ids: torch.Tensor,
                   row_idx: torch.Tensor,
                   top_k: int,
-                  expert_map: torch.Tensor = None):
+                  expert_map: torch.Tensor = None,
+                  new_stream: Optional[dict] = None,
+                  ):
     original_shape = hidden_states.shape
     if len(original_shape) == 3:
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
@@ -704,7 +710,8 @@ def fused_experts(hidden_states: torch.Tensor,
                               w2,
                               w2_scale,
                               expert_tokens,
-                              group_list_type=group_list_type)
+                              group_list_type=group_list_type,
+                              new_stream=new_stream)
 
     if expert_map is not None:
         hidden_states.mul_(sorted_weights.unsqueeze(1))
@@ -908,6 +915,7 @@ class AscendW8A8DynamicFusedMoEMethod:
         dynamic_scale_for_share: Optional[Any] = None,
         prefix: str = "",
         running_in_super_kernel: bool = False,
+        new_stream: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         assert router_logits.shape[
@@ -1014,7 +1022,8 @@ class AscendW8A8DynamicFusedMoEMethod:
                                  topk_ids=topk_ids,
                                  row_idx=row_idx,
                                  top_k=top_k,
-                                 expert_map=expert_map)
+                                 expert_map=expert_map,
+                                 new_stream=new_stream)
         else:
             # The current implementation of deepseek moe splits hidden_states
             # according to tp_size before they are feed into fused_moe module.
