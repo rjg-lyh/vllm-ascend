@@ -181,6 +181,13 @@ def set_ascend_forward_context(
         forward_context.flashcomm_v1_enabled = envs_ascend.VLLM_ASCEND_ENABLE_FLASHCOMM and \
             num_tokens is not None and num_tokens > 1000
 
+        # set this for MLP weight prefetch
+        forward_context.mlp_prefetch_enabled = False
+        if envs_ascend.VLLM_ASCEND_ENABLE_PREFETCH_MLP == 1 and \
+            attn_metadata is not None and \
+            attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
+            forward_context.mlp_prefetch_enabled = True
+
         if num_tokens is None and attn_metadata is not None:
             num_tokens = attn_metadata.num_actual_tokens
 

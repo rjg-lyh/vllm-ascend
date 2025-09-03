@@ -59,10 +59,13 @@ class AscendSiluAndMul(SiluAndMul):
         if is_310p():
             out = torch_npu.npu_swiglu(x.to(torch.float32)).to(torch.float16)
         else:
-            dependency = x
-            self.prefetch_down_proj(dependency)
+            forward_context = get_forward_context()
+            if forward_context.mlp_prefetch_enabled:
+                dependency = x
+                self.prefetch_down_proj(dependency)
 
             out = torch_npu.npu_swiglu(x)
 
-            self.wait_prefetch_done()
+            if forward_context.mlp_prefetch_enabled:
+                self.wait_prefetch_done()
         return out

@@ -502,8 +502,9 @@ class AscendDenseRowParallelLinear(RowParallelLinear):
                                                       input_parallel,
                                                       bias=bias_)
 
-            dependency = output_parallel
-            self.prefetch_gate_up_proj(dependency)
+            if forward_context.mlp_prefetch_enabled:
+                dependency = output_parallel
+                self.prefetch_gate_up_proj(dependency)
 
             output = torch.ops.vllm.flashcomm_reduce(output_parallel)
 

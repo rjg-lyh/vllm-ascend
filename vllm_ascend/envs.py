@@ -161,6 +161,9 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # this feature in eager mode will get better performance.
     "VLLM_ASCEND_ENABLE_MLP_OPTIMIZE":
     lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_MLP_OPTIMIZE", '0'))),
+    # Whether to enable MLP weight prefetch, only used in decode.
+    "VLLM_ASCEND_ENABLE_PREFETCH_MLP":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_PREFETCH_MLP", '0'))),
 }
 
 # end-env-vars-definition
