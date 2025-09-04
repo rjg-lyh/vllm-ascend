@@ -53,6 +53,7 @@ class AddRMSNormW8A8Quant(RMSNorm):
                 self.layer.aclnn_input_scale,
                 self.layer.aclnn_input_offset,
                 epsilon=self.variance_epsilon)
+            torch.ops.vllm.maybe_wait_prefetch_done(x)
             return x, residual
 
         x, residual = torch_npu.npu_rms_norm(x, self.weight,
@@ -82,6 +83,7 @@ class AscendRMSNorm(RMSNorm):
             else:
                 x, _, residual = torch_npu.npu_add_rms_norm(
                     x, residual, self.weight, self.variance_epsilon)
+                torch.ops.vllm.maybe_wait_prefetch_done(x)
             return x, residual
 
         x, residual = torch_npu.npu_rms_norm(x, self.weight,

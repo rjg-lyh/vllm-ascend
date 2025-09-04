@@ -24,7 +24,6 @@ from vllm.distributed import (divide, get_tensor_model_parallel_rank,
                               split_tensor_along_last_dim,
                               tensor_model_parallel_all_gather,
                               tensor_model_parallel_all_reduce)
-from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.quantization.base_config import \
     QuantizationConfig
 from vllm.model_executor.utils import set_weight_attrs
@@ -32,14 +31,10 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm_ascend.distributed.parallel_state import (
     get_mlp_tensor_model_parallel_rank,
     get_mlp_tensor_model_parallel_world_size, get_mlp_tp_group)
-from vllm_ascend.quantization.w8a8 import AscendW8A8LinearMethod
-from vllm_ascend.utils import (all_gather_and_maybe_unpad,
-                               maybe_pad_and_reduce_scatter)
 
 from vllm.model_executor.layers.linear import (  # isort: skip
     WEIGHT_LOADER_V2_SUPPORTED, ColumnParallelLinear, LinearBase,
-    MergedColumnParallelLinear, QKVParallelLinear, RowParallelLinear,
-    UnquantizedLinearMethod)
+    MergedColumnParallelLinear, QKVParallelLinear, RowParallelLinear)
 
 
 class AscendMlpColumnParallelLinear(ColumnParallelLinear):
@@ -405,6 +400,7 @@ class AscendDenseRowParallelLinear(RowParallelLinear):
                                                       input_parallel,
                                                       bias=bias_)
             output = torch.ops.vllm.maybe_pad_and_reduce(output_parallel)
+            torch.ops.vllm.maybe_prefetch_mlp_gate_up_proj(output, self.prefix)
 
         output_bias = self.bias if self.skip_bias_add else None
 
