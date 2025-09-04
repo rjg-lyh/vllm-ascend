@@ -155,6 +155,39 @@ class TestAscendRotaryEmbedding(unittest.TestCase):
         self.assertEqual(result_q.shape, self.query.shape)
         self.assertEqual(result_k.shape, self.key.shape)
 
+    @patch('vllm_ascend.ops.rotary_embedding._custom_rotary_embedding_enabled',
+        return_value=False)
+    @patch('torch_npu._npu_rotary_embedding')
+    @patch('vllm.config.ModelConfig.__post_init__', MagicMock())
+    @patch('vllm.config.VllmConfig.__post_init__', MagicMock())
+    @patch('vllm.distributed.parallel_state._DP', MagicMock(world_size=1))
+    def test_rope_forward_oot_contiguous(self, mock_npu_rotary,
+                                         mock_custom_enabled):
+        mock_config = MagicMock()
+        mock_config.torchair_graph_config.enabled = False
+
+        # Test contiguous path when custom is disabled
+        non_contig_query = self.query.transpose(0, 1)
+        non_contig_key = self.key.transpose(0, 1)
+        vllm_config = VllmConfig()
+        model_config = ModelConfig(MODEL,
+                                    tokenizer=MODEL, 
+                                    max_model_len=MAX_NUM_BATCHED_TOKENS
+                                    )
+        model_config.hf_config = PretrainedConfig()
+        vllm_config.model_config = model_config
+        with set_ascend_forward_context(None, vllm_config):
+            result_q, result_k = self.layer.forward(self.positions,
+                                                    non_contig_query,
+                                                    non_contig_key)
+
+        mock_npu_rotary.assert_called_once()
+        self.assertEqual(result_q.shape, non_contig_query.shape)
+        self.assertEqual(result_k.shape, non_contig_key.shape)
+
+    @patch('vllm.config.ModelConfig.__post_init__', MagicMock())
+    @patch('vllm.config.VllmConfig.__post_init__', MagicMock())
+    @patch('vllm.distributed.parallel_state._DP', MagicMock(world_size=1))
     def test_rope_forward_oot_with_offsets(self):
         mock_config = MagicMock()
         mock_config.torchair_graph_config.enabled = False
