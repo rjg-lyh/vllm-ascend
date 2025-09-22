@@ -135,7 +135,6 @@ def set_ascend_forward_context(
             num_tokens is not None and num_tokens < 500
         if prefetch_mlp_enabled:
             forward_context.prefetch_stream = prefetch_stream
-            forward_context.model_instance = model_instance
             forward_context.prefetch_mlp_gate_up_proj = False
             forward_context.prefetch_mlp_down_proj = False
         forward_context.prefetch_mlp_enabled = prefetch_mlp_enabled

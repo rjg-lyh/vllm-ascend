@@ -1,3 +1,4 @@
+from typing import Optional
 import torch
 import torch.nn.functional as F
 import torch_npu
@@ -6,10 +7,103 @@ from vllm.distributed import (get_tensor_model_parallel_rank,
                               tensor_model_parallel_all_gather,
                               tensor_model_parallel_all_reduce,
                               tensor_model_parallel_reduce_scatter)
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.utils import direct_register_custom_op
 
 import vllm_ascend.envs as envs_ascend
+
+
+def _apply_matmul_and_reduce_impl(
+        prefix: str,
+        input_parallel: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+    try:
+        forward_context = get_forward_context()
+        flashcomm_v1_enabled = forward_context.flashcomm_v1_enabled
+    except AssertionError:
+        flashcomm_v1_enabled = False
+
+    layer_idx = int(prefix.split('.')[2])
+    layer_name = prefix.split('.')[-1]
+    model_instance = forward_context.model_instance
+    if layer_name == "o_proj":
+        layer = model_instance.model.layers[layer_idx].self_attn.o_proj
+    if layer_name == "down_proj":
+        layer = model_instance.model.layers[layer_idx].mlp.down_proj
+    
+    if not flashcomm_v1_enabled:
+        output_parallel = layer.quant_method.apply(layer,
+                                                   input_parallel,
+                                                   bias=bias)
+        return tensor_model_parallel_all_reduce(output_parallel)
+
+    pad_size = forward_context.pad_size
+    if pad_size > 0:
+        input_parallel = F.pad(input_parallel, (0, 0, 0, pad_size))
+
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    from vllm_ascend.quantization.w8a8 import AscendW8A8LinearMethod, quant_per_tensor
+    # no quant
+    if isinstance(layer.quant_method, UnquantizedLinearMethod):
+        output_parallel = torch.empty(input_parallel.shape[0] // layer.tp_size,
+                                      layer.weight.shape[0],
+                                      dtype=layer.params_dtype,
+                                      device=input_parallel.device)
+        hcom_name = get_tp_group().device_group._get_backend(torch.device('npu')).get_hccl_comm_name(layer.tp_rank)
+        world_size = layer.tp_size
+        comm_mode = "aiv"
+        output = torch_npu.npu_mm_reduce_scatter_base(input_parallel, 
+                                                      layer.weight.t(), 
+                                                      hcom_name, 
+                                                      world_size, 
+                                                      reduce_op="sum", 
+                                                      bias=None, 
+                                                      comm_turn=0, 
+                                                      comm_mode=comm_mode)
+    # w8a8 quant
+    elif isinstance(layer.quant_method.quant_method, AscendW8A8LinearMethod):
+        if input_parallel.dtype != torch.int8:
+            input_parallel_quant = quant_per_tensor(input_parallel, layer.aclnn_input_scale_reciprocal, layer.aclnn_input_offset)
+        else:
+            input_parallel_quant = input_parallel
+        output_parallel = torch.empty(input_parallel_quant.shape[0] // layer.tp_size,
+                                      layer.weight.shape[1],
+                                      dtype=layer.params_dtype,
+                                      device=input_parallel.device)
+        quant_bias = layer.quant_bias
+        hcom_name = get_tp_group().device_group._get_backend(torch.device('npu')).get_hccl_comm_name(layer.tp_rank)
+        world_size = layer.tp_size
+        deq_scale = layer.deq_scale
+        output_dtype = torch.bfloat16
+        comm_mode = "aiv"
+        output_parallel = torch_npu.npu_mm_reduce_scatter_base(input_parallel_quant, 
+                                                               layer.weight, 
+                                                               hcom_name, 
+                                                               world_size, 
+                                                               reduce_op="sum", 
+                                                               bias=None, 
+                                                               comm_turn=0, 
+                                                               x2_scale=deq_scale, 
+                                                               output_dtype=output_dtype, 
+                                                               comm_mode=comm_mode)
+        output = torch.add(output_parallel, torch.mul(quant_bias, deq_scale).to(layer.params_dtype))
+    else:
+        output_parallel = layer.quant_method.apply(layer,
+                                                   input_parallel,
+                                                   bias=bias)
+        output = tensor_model_parallel_reduce_scatter(output_parallel, 0)
+
+    return output
+
+
+def _apply_matmul_and_reduce_impl_fake(
+        prefix: str,
+        input_parallel: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+    return input_parallel
 
 
 def _maybe_chunk_residual_impl(x: torch.Tensor,
@@ -147,6 +241,12 @@ def _maybe_wait_prefetch_done_impl(x: torch.Tensor) -> None:
 def _maybe_wait_prefetch_done_impl_fake(x: torch.Tensor) -> None:
     return
 
+
+direct_register_custom_op(op_name="apply_matmul_and_reduce",
+                          op_func=_apply_matmul_and_reduce_impl,
+                          fake_impl=_apply_matmul_and_reduce_impl_fake,
+                          mutates_args=[],
+                          dispatch_key="PrivateUse1")
 
 direct_register_custom_op(op_name="maybe_chunk_residual",
                           op_func=_maybe_chunk_residual_impl,
