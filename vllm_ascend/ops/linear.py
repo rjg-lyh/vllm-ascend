@@ -26,7 +26,8 @@ from vllm.distributed import (divide, get_tensor_model_parallel_rank,
                               split_tensor_along_last_dim,
                               tensor_model_parallel_all_gather,
                               tensor_model_parallel_all_reduce,
-                              tensor_model_parallel_reduce_scatter)
+                              tensor_model_parallel_reduce_scatter,
+                              get_tp_group)
 from vllm.model_executor.layers.linear import (WEIGHT_LOADER_V2_SUPPORTED,
                                                ColumnParallelLinear,
                                                LinearBase,
@@ -481,9 +482,18 @@ class AscendDenseRowParallelLinear(RowParallelLinear):
             if pad_size > 0:
                 input_parallel = F.pad(input_parallel, (0, 0, 0, pad_size))
             output_parallel = torch.empty(input_parallel.shape[0] // self.tp_size, self.weight.shape[0], dtype=self.params_dtype, device=input_parallel.device)
-            current_rank = torch.npu.current_device()
-            commDomain = str(current_rank // self.tp_size)
-            torch_npu.atb._npu_matmul_reduce_scatter(input_parallel, self.weight, output_parallel, None, None,  rank=self.tp_rank, rankSize=self.tp_size, commDomain=commDomain, outdata_type=27)
+            hcom_name = get_tp_group().device_group._get_backend(torch.device('npu')).get_hccl_comm_name(self.tp_rank)
+            world_size = self.tp_size
+            output_dtype = torch.bfloat16
+            comm_mode = "aiv"
+            output_parallel = torch_npu.npu_mm_reduce_scatter_base(input_parallel, 
+                                                                   self.weight.t(), 
+                                                                   hcom_name, 
+                                                                   world_size, 
+                                                                   reduce_op="sum", 
+                                                                   bias=None, 
+                                                                   comm_turn=0, 
+                                                                   comm_mode=comm_mode)
             output = output_parallel
         # w8a8
         elif matmul_rs_enabled and isinstance(self.quant_method.quant_method, AscendW8A8LinearMethod):
@@ -494,12 +504,25 @@ class AscendDenseRowParallelLinear(RowParallelLinear):
             else:
                 input_parallel_quant = input_parallel
             output_parallel = torch.empty(input_parallel_quant.shape[0] // self.tp_size, self.weight.shape[1], dtype=self.params_dtype, device=input_parallel.device)
-            bias_ = self.quant_bias if tp_rank == 0 else torch.zeros(self.weight.shape[1], dtype=torch.int).unsqueeze(0)
-            current_rank = torch.npu.current_device()
-            commDomain = str(current_rank // self.tp_size)
-            deq_scale = self.deq_scale.unsqueeze(0)
-            torch_npu.atb._npu_matmul_reduce_scatter(input_parallel_quant, self.weight, output_parallel, bias_, deqScale=deq_scale, rank=self.tp_rank, rankSize=self.tp_size, commDomain=commDomain, outdata_type=27)     # outdata_type参数，bf16=27, fp16=1
-            output = output_parallel
+            bias_ = self.quant_bias
+            
+            hcom_name = get_tp_group().device_group._get_backend(torch.device('npu')).get_hccl_comm_name(self.tp_rank)
+            world_size = self.tp_size
+            deq_scale = self.deq_scale
+            output_dtype = torch.bfloat16
+            comm_mode = "aiv"
+            output_parallel = torch_npu.npu_mm_reduce_scatter_base(input_parallel_quant, 
+                                                                   self.weight, 
+                                                                   hcom_name, 
+                                                                   world_size, 
+                                                                   reduce_op="sum", 
+                                                                   bias=None, 
+                                                                   comm_turn=0, 
+                                                                   x2_scale=deq_scale, 
+                                                                   output_dtype=output_dtype, 
+                                                                   comm_mode=comm_mode)
+            output = torch.add(output_parallel, torch.mul(bias_, deq_scale).to(torch.bfloat16))
+
         else:
             output_parallel = self.quant_method.apply(self,
                                                     input_parallel,
