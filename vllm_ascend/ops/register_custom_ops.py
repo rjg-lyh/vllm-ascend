@@ -111,7 +111,98 @@ def _apply_matmul_and_reduce_impl_fake(
         layer = model_instance.model.layers[layer_idx].mlp.down_proj
     output_size_per_partition = layer.output_size_per_partition
     pad_size = output_size_per_partition - input_parallel.size(1)
-    output = F.pad(input_parallel, (0, pad_size))
+    if pad_size >= 0:
+        output = F.pad(input_parallel, (0, pad_size))
+    else:
+        output = input_parallel[:, :output_size_per_partition]
+
+    return output
+
+
+def _apply_maybe_gather_and_matmul_impl(
+        prefix: str,
+        input_: torch.Tensor,
+    ) -> torch.Tensor:
+    try:
+        forward_context = get_forward_context()
+        sp_enabled = forward_context.sp_enabled
+    except AssertionError:
+        sp_enabled = False
+
+    layer_idx = int(prefix.split('.')[2])
+    layer_name = prefix.split('.')[-1]
+    model_instance = forward_context.model_instance
+    if layer_name == "qkv_proj":
+        layer = model_instance.model.layers[layer_idx].self_attn.qkv_proj
+    if layer_name == "gate_up_proj":
+        layer = model_instance.model.layers[layer_idx].mlp.gate_up_proj
+
+    if not sp_enabled:
+        output_parallel = layer.quant_method.apply(layer, input_, None)
+        return output_parallel
+    
+    pad_size = forward_context.pad_size
+    
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    from vllm_ascend.quantization.w8a8 import AscendW8A8LinearMethod, quant_per_tensor
+    # 浮点
+    if isinstance(layer.quant_method, UnquantizedLinearMethod):
+        pass
+    # w8a8
+    elif isinstance(layer.quant_method.quant_method, AscendW8A8LinearMethod):
+        output_parallel = torch.empty(input_.shape[0]*layer.tp_size, layer.weight.shape[1], dtype=layer.params_dtype, device=input_.device)
+        if input_.dtype != torch.int8:
+            input_quant = quant_per_tensor(input_, layer.aclnn_input_scale_reciprocal, layer.aclnn_input_offset)
+        else:
+            input_quant = input_
+        bias_ = layer.quant_bias
+        deq_scale = layer.deq_scale
+        # torch_npu.atb._npu_all_gather_matmul(input_quant, self.weight, output_parallel, bias_, deqScale=deq_scale, rank=tp_rank, rankSize=self.tp_size, commDomain=commDomain, outdata_type=27)
+        
+        hcom_name = get_tp_group().device_group._get_backend(torch.device('npu')).get_hccl_comm_name(layer.tp_rank)
+        output_dtype = layer.params_dtype
+        comm_mode = "aiv"
+        x2_scale = layer.deq_scale
+
+        output, _ = torch_npu.npu_all_gather_base_mm(input_quant,      
+                                                        layer.weight,
+                                                        hcom_name,
+                                                        layer.tp_size,
+                                                        comm_mode=comm_mode,
+                                                        x2_scale=x2_scale,
+                                                        output_dtype=output_dtype)
+        output_parallel = torch.add(output, torch.mul(bias_, deq_scale).to(torch.bfloat16)) 
+        
+        # if bias is not None:
+        #     bias = bias.reshape(1, -1)
+        #     output_parallel = torch.add(output_parallel, bias)
+        if pad_size > 0:
+            output_parallel = output_parallel[:-pad_size, :]
+    else:
+        input_ = tensor_model_parallel_all_gather(input_, 0)
+        if pad_size > 0:
+            input_ = input_[:-pad_size, :]
+        output_parallel = layer.quant_method.apply(layer, input_, None)
+    return output_parallel
+
+
+def _apply_maybe_gather_and_matmul_impl_fake(
+        prefix: str,
+        input_: torch.Tensor,
+    ) -> torch.Tensor:
+    model_instance = get_forward_context().model_instance
+    layer_idx = int(prefix.split('.')[2])
+    layer_name = prefix.split('.')[-1]
+    if layer_name == "qkv_proj":
+        layer = model_instance.model.layers[layer_idx].self_attn.qkv_proj
+    if layer_name == "gate_up_proj":
+        layer = model_instance.model.layers[layer_idx].mlp.gate_up_proj
+    output_size_per_partition = layer.output_size_per_partition
+    pad_size = output_size_per_partition - input_.size(1)
+    if pad_size >= 0:
+        output = F.pad(input_, (0, pad_size))
+    else:
+        output = input_[:, :output_size_per_partition]
 
     return output
 
@@ -318,5 +409,11 @@ direct_register_custom_op(op_name="maybe_all_reduce_tensor_model_parallel",
 direct_register_custom_op(op_name="apply_matmul_and_reduce",
                           op_func=_apply_matmul_and_reduce_impl,
                           fake_impl=_apply_matmul_and_reduce_impl_fake,
+                          mutates_args=[],
+                          dispatch_key="PrivateUse1")
+
+direct_register_custom_op(op_name="apply_maybe_gather_and_matmul",
+                          op_func=_apply_maybe_gather_and_matmul_impl,
+                          fake_impl=_apply_maybe_gather_and_matmul_impl_fake,
                           mutates_args=[],
                           dispatch_key="PrivateUse1")

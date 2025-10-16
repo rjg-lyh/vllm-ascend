@@ -328,8 +328,9 @@ class SequenceColumnParallelOp(CustomColumnParallelOp):
         # Matrix multiply.
         assert self.quant_method is not None
 
-        input_ = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(input_, True)
-        output_parallel = self.quant_method.apply(self.layer, input_, bias)
+        # input_ = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(input_, True)
+        # output_parallel = self.quant_method.apply(self.layer, input_, bias)
+        output_parallel = torch.ops.vllm.apply_maybe_gather_and_matmul(self.prefix, input_)
 
         if self.gather_output:
             # All-gather across the partitions.
