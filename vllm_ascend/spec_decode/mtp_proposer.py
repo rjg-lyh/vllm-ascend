@@ -63,7 +63,10 @@ if vllm_version_is("0.11.0"):
     _deepseek_mtp_model = "AscendDeepSeekMTP"
 
 _MTP_MODELS = {
-    "DeepseekV3ForCausalLM": (_deepseek_mtp_path, _deepseek_mtp_model),
+    "DeepseekV3ForCausalLM":
+    ("vllm.model_executor.models.deepseek_mtp", "DeepSeekMTP"),
+    "DeepseekV32ForCausalLM":
+    ("vllm.model_executor.models.deepseek_mtp", "DeepSeekMTP"),
     "Qwen3NextForCausalLM":
     ("vllm_ascend.models.qwen3_next_mtp", "CustomQwen3NextMTP")
 }
@@ -809,9 +812,11 @@ class MtpProposer(Proposer):
             input_ids = draft_token_ids_list[-1].int()
             positions += 1
 
+            decode_meta = getattr(attn_metadata_i, "decode", None)
+            prefill_meta = getattr(attn_metadata_i, "prefill", None)
             # When disable_padded_drafter_batch=False, it should not to be updating these params, maybe.
-            if self.speculative_config.disable_padded_drafter_batch or \
-                    aclgraph_runtime_mode != CUDAGraphMode.FULL:
+            if decode_meta is not None and (self.speculative_config.disable_padded_drafter_batch or \
+                    aclgraph_runtime_mode != CUDAGraphMode.FULL):
                 attn_metadata_i.decode.actual_seq_lengths_q = attn_metadata_i.query_start_loc[
                     1:batch_size + 1].tolist()
                 if aclgraph_runtime_mode == CUDAGraphMode.FULL:
@@ -859,7 +864,7 @@ class MtpProposer(Proposer):
                 self.input_ids[batch_size:num_input_tokens] = 0
                 self.hidden_states[batch_size:num_input_tokens].fill_(0)
 
-            if attn_metadata_i.prefill is not None:
+            if prefill_meta is not None:
                 attn_metadata_i.prefill.seq_lens = attn_metadata_i.seq_lens
                 attn_metadata_i.prefill.seq_lens_list = attn_metadata_i.prefill.seq_lens.tolist(
                 )
@@ -870,7 +875,7 @@ class MtpProposer(Proposer):
                 attn_metadata_i.prefill.max_seq_lens = min(
                     attn_metadata_i.prefill.max_seq_lens,
                     self.runner.model_config.max_model_len)
-            if attn_metadata_i.decode is not None:
+            if decode_meta is not None:
                 attn_metadata_i.decode.seq_lens = attn_metadata_i.seq_lens
                 attn_metadata_i.decode.seq_lens_list = attn_metadata_i.decode.seq_lens.tolist(
                 )
