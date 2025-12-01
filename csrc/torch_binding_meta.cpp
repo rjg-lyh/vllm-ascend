@@ -115,6 +115,14 @@ std::tuple<at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &> mla_preproces
 }
 
 
+void batch_matmul_transpose(const at::Tensor &tensor_a, const at::Tensor &tensor_b, at::Tensor &tensor_c,
+                                    c10::optional<c10::string_view> format_mode,
+                                    c10::optional<c10::string_view> quant_mode)
+{
+    return;
+
+}
+
 } // namespace meta
 } // namespace vllm_ascend
 
@@ -132,5 +140,11 @@ namespace {
     ops.impl("sgmv_expand", &vllm_ascend::meta::sgmv_expand_meta);
     // MLA preprocess
     ops.impl("mla_preprocess", &vllm_ascend::meta::mla_preprocess);
+    // grouped_matmul_swiglu_quant meta implementation
+    ops.impl("grouped_matmul_swiglu_quant", &vllm_ascend::meta::grouped_matmul_swiglu_quant);
+    // Grouped matmul swiglu quant weight nz tensor list
+    ops.impl("grouped_matmul_swiglu_quant_weight_nz_tensor_list", &vllm_ascend::meta::grouped_matmul_swiglu_quant_weight_nz_tensor_list_meta);
+    // batch_matmul_transpose
+    ops.impl("batch_matmul_transpose", &vllm_ascend::meta::batch_matmul_transpose);
 }
 }
