@@ -853,6 +853,90 @@ class AscendSFAImpl(MLAAttentionImpl):
         output[...] = self.o_proj(attn_output)[0]
         return output_padded
 
+    def indexer_select_pre_process(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        need_gather_q_kv: bool = False,
+    ):
+        k_proj, _ = self.wk(x)  # [b,s,7168] @ [7168,128] = [b,s,128]
+        k_proj = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
+            k_proj, need_gather_q_kv)
+        k = self.k_norm(k_proj).unsqueeze(1)
+        k = k.view(-1, 1, self.head_dim)
+
+        k_pe, k_nope = torch.split(
+            k,
+            [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim],
+            dim=-1)  # [b,s,64+64]
+
+        k_pe = k_pe.unsqueeze(2)
+        k_pe = torch_npu.npu_interleave_rope(k_pe, cos, sin)
+        k_pe = k_pe.squeeze(2)
+
+        k = torch.cat([k_pe, k_nope], dim=-1)  # [b*s,128]
+
+        return k
+
+    def indexer_select_post_process(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        q: Optional[torch.Tensor],
+        k: torch.Tensor,
+        kv_cache: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        attn_metadata: M,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+        need_gather_q_kv: bool = False,
+    ):
+        if q is None:
+            q, _ = self.wq_b(qr)  # [b,s,1536] @ [1536,64*128] = [b,s,64*128]
+            q = q.view(-1, self.n_head, self.head_dim)  # [n_toks,64,128]
+
+            cos_q, sin_q = cos, sin
+            cos = cos.view(-1, 1, 1, self.qk_rope_head_dim)
+            sin = sin.view(-1, 1, 1, self.qk_rope_head_dim)
+
+            q_pe, q_nope = torch.split(
+                q,
+                [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim],
+                dim=-1)  # [b,s,64,64+64]
+
+            q_pe = q_pe.unsqueeze(2)
+            q_pe = torch_npu.npu_interleave_rope(q_pe, cos_q, sin_q)
+            q_pe = q_pe.squeeze(2)
+            q = torch.cat([q_pe, q_nope], dim=-1)  # [b*s,64,128]
+
+        if kv_cache is not None:
+            torch_npu.npu_scatter_nd_update_(kv_cache[2].view(-1, k.shape[-1]),
+                                             attn_metadata.slot_mapping.view(
+                                                 -1, 1),
+                                             k.view(-1,
+                                                    k.shape[-1]))  # b, s, n, d
+
+        weights, _ = self.weights_proj(x)
+        weights = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
+            weights, need_gather_q_kv)
+
+        block_table = attn_metadata.block_tables
+
+        topk_indices = torch.ops._C_ascend.npu_lightning_indexer(
+            query=q,
+            key=kv_cache[2],
+            weights=weights,
+            actual_seq_lengths_query=actual_seq_lengths_query,
+            actual_seq_lengths_key=actual_seq_lengths_key,
+            block_table=block_table,
+            layout_query="TND",
+            layout_key="PA_BSND",
+            sparse_count=2048,
+            sparse_mode=3)
+        return topk_indices
+
     def indexer_select(
         self,
         x: torch.Tensor,
