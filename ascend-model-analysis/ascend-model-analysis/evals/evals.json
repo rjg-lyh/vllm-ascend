@@ -1,0 +1,23 @@
+{
+  "skill_name": "ascend-model-analysis",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "你是昇腾大语言推理领域的专家，现在需要对新发布的模型做0day适配。该模型的模型config.json承载在本地glm5.1目录, python脚本承载在transformers\\src\\transformers\\models\\glm_moe_dsa 目录中。请帮忙根据模型的python脚本，config.json分析模型的结构，给出四章节的模型结构分析报告：1）架构概览，包含参数配置表，层分布图和层类型汇总；2）单层正向算子分析，包含算子执行流图和算子明细表；3）KVCache与参数量估算；4）vLLM Ascend增量算子/特性。",
+      "expected_output": "A complete HTML file with 4 chapters covering GLM5.1 (GlmMoeDsa) architecture: 78 MLA+DSA layers, 256 experts, DSA Indexer, KVCache compression, P0 operators like FusedDSAIndexer",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "帮我分析一下Qwen3.5-397B-A17B这个模型的架构，config在Qwen3.5-397B-A17B目录，建模代码在transformers/src/transformers/models/qwen3_5_moe/，需要输出昇腾0day适配分析报告HTML",
+      "expected_output": "A complete HTML file analyzing Qwen3.5 multimodal hybrid-attention MoE: Full Attn + Gated Delta Rule linear attention, 512 experts, MRoPE, CausalConv1d, P0 operators like FusedGatedDeltaRule and FusedCausalConv1d",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "新模型发布，需要做昇腾适配分析。模型配置在ling-2.6-flash/config.json，建模脚本在transformers/src/transformers/models/bailing_moe/，请生成模型分析报告",
+      "expected_output": "A complete HTML file analyzing Bailing MoE V2.5 hybrid MLA+Linear attention model: SimpleGLA linear attention, MLA attention (4 layers), MoE with GroupLimitedTopK, P0 operators like FusedSimpleGLA and FusedMLAProj",
+      "files": []
+    }
+  ]
+}
